@@ -96,7 +96,7 @@ async def list_strategies(
 # ===========================================================================
 
 @router.get(
-    "/{strategy_id}",
+    "/{strategy_name}",
     response_model=StrategyDetail,
     summary="Get strategy detail",
     description=(
@@ -116,13 +116,13 @@ async def list_strategies(
     },
 )
 async def get_strategy(
-    strategy_id: int,
+    strategy_name: str,
     db: DB,
 ) -> StrategyDetail:
-    strategy = await strategy_service.get_strategy_by_id(db, strategy_id)
+    strategy = await strategy_service.get_strategy_by_name(db, strategy_name)
     if strategy is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Strategy with id={strategy_id} not found.",
+            detail=f"Strategy with id={strategy_name} not found.",
         )
     return strategy

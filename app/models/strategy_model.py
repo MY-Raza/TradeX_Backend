@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from typing import Optional
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -17,20 +17,17 @@ class StrategyRegistry(Base):
     """Maps to the `strategy_registry` PostgreSQL table."""
 
     __tablename__ = "strategy_registry"
+    __table_args__ = {"schema": "strategies"} 
 
     # ── Primary key ────────────────────────────────────────────────────────
-    id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True, index=True
+    strategy: Mapped[str] = mapped_column(
+        String(100), primary_key=True, index=True,
+        comment="Strategy identifier, e.g. sig_1h_btc_1"
     )
 
     # =========================================================================
     # GROUP 1 – Meta / Identity
     # =========================================================================
-
-    strategy: Mapped[str] = mapped_column(
-        String(100), nullable=False, unique=True, index=True,
-        comment="Strategy identifier, e.g. sig_1h_btc_1"
-    )
     symbol: Mapped[str] = mapped_column(
         String(20), nullable=False, index=True,
         comment="Ticker symbol: btc, eth, bnb, ada, xrp, doge, sol, dot, matic"
@@ -39,13 +36,13 @@ class StrategyRegistry(Base):
         String(10), nullable=False, index=True,
         comment="Candle timeframe: 1h, 15m, 5m"
     )
-    tp: Mapped[int | None] = mapped_column(
-        SmallInteger, nullable=True, comment="Take-profit multiplier"
+    tp: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True, comment="Take-profit multiplier"
     )
-    sl: Mapped[int | None] = mapped_column(
-        SmallInteger, nullable=True, comment="Stop-loss multiplier"
+    sl: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True, comment="Stop-loss multiplier"
     )
-    pnl_sum: Mapped[float | None] = mapped_column(
+    pnl_sum: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True, comment="Cumulative back-test PnL"
     )
 

@@ -23,7 +23,6 @@ from pydantic import BaseModel, ConfigDict, Field
 # ===========================================================================
 
 class StrategyBase(BaseModel):
-    id:           int   = Field(..., description="Primary key")
     name:         str   = Field(..., description="Strategy identifier, e.g. sig_1h_btc_1")
     symbol:       str   = Field(..., description="Ticker, e.g. btc / eth")
     time_horizon: str   = Field(..., description="Candle timeframe: 1h | 15m | 5m")
@@ -70,8 +69,8 @@ class StrategyDetail(StrategyListItem):
           "bop":  {}          # no period for this indicator
         }
     """
-    tp: Optional[int] = Field(None, description="Take-profit multiplier")
-    sl: Optional[int] = Field(None, description="Stop-loss multiplier")
+    tp: Optional[str] = None
+    sl: Optional[str] = None
 
     indicator_details: dict[str, dict[str, Optional[int]]] = Field(
         default_factory=dict,

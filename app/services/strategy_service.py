@@ -184,7 +184,6 @@ def _build_indicator_details(
 def _to_list_item(row: StrategyRegistry) -> StrategyListItem:
     """Convert an ORM row to StrategyListItem (table card)."""
     return StrategyListItem(
-        id=row.id,
         name=row.strategy,
         symbol=row.symbol,
         time_horizon=row.timehorizon,
@@ -198,7 +197,6 @@ def _to_detail(row: StrategyRegistry) -> StrategyDetail:
     """Convert an ORM row to StrategyDetail (full record)."""
     active = _active_indicators(row)
     return StrategyDetail(
-        id=row.id,
         name=row.strategy,
         symbol=row.symbol,
         time_horizon=row.timehorizon,
@@ -258,7 +256,7 @@ async def get_strategies(
 
     stmt = (
         stmt
-        .order_by(StrategyRegistry.id)
+        .order_by(StrategyRegistry.strategy)
         .limit(page_size)
         .offset(offset)
     )
@@ -274,15 +272,15 @@ async def get_strategies(
     )
 
 
-async def get_strategy_by_id(
+async def get_strategy_by_name(
     db: AsyncSession,
-    strategy_id: int,
+    strategy_name: str,
 ) -> Optional[StrategyDetail]:
     """
     Return the full detail record for a single strategy.
     Returns None if not found (the route raises 404).
     """
-    stmt = select(StrategyRegistry).where(StrategyRegistry.id == strategy_id)
+    stmt = select(StrategyRegistry).where(StrategyRegistry.strategy == strategy_name)
     row: Optional[StrategyRegistry] = (await db.execute(stmt)).scalars().first()
     return _to_detail(row) if row else None
 
