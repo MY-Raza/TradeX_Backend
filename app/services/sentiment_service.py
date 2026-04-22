@@ -27,7 +27,7 @@ import math
 from typing import Optional
 
 from fastapi import HTTPException, status
-from sqlalchemy import inspect, select, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.sentiment_model import (
@@ -180,7 +180,6 @@ async def _fetch_results(db: AsyncSession, coin: str) -> SentimentResultsRespons
     Read all four sentiment tables for the given coin using SQLAlchemy Table()
     objects and build the response. Raises HTTP 404 if any table is missing.
     """
-    # Resolve Table() descriptors for this coin
     tbl_posts    = get_posts_sentiment_table(coin)
     tbl_comments = get_comments_sentiment_table(coin)
     tbl_ph       = get_posts_hourly_table(coin)
@@ -241,8 +240,6 @@ def _run_scraper() -> None:
     """
     Import and execute the reddit scraper synchronously.
     Designed to be called via asyncio.to_thread().
-
-    The scraper executes at module level, so we import (or reload) it to run it.
     """
     import importlib
     import os
@@ -269,9 +266,45 @@ def _run_sentiment_pipeline(coin: str) -> None:
     """
     Execute the FinBERT sentiment pipeline for the given coin.
     Designed to be called via asyncio.to_thread().
+
+    Tries multiple known module paths for sentiment_analysis so the service
+    works regardless of whether it is run from inside the app package or the
+    project root.
     """
-    from app.services.sentiment_analysis import run_pipeline   # lazy import
-    run_pipeline(coin=coin, apply_coin_filter=True, save_to_database=True)
+    import importlib
+    import os
+    import sys
+
+    # Make sure the project root is on sys.path
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..")
+    )
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    # Candidate module paths – tried in order; first successful import wins.
+    candidates = [
+        "TradeX.sentiments.sentiment_analysis",   # TradeX/sentiments/sentiment_analysis.py
+        "TradeX.sentiments.data.sentiment_analysis",  # TradeX/sentiments/data/sentiment_analysis.py
+        "app.services.sentiment_analysis",        # app/services/sentiment_analysis.py  (fallback)
+    ]
+
+    last_exc = None
+    for module_path in candidates:
+        try:
+            mod = importlib.import_module(module_path)
+            mod.run_pipeline(coin=coin, apply_coin_filter=True, save_to_database=True)
+            return   # success — stop trying
+        except ModuleNotFoundError as exc:
+            last_exc = exc
+            continue  # try next candidate
+        # Any other exception (e.g. runtime error inside pipeline) should propagate
+        # immediately — don't swallow it.
+
+    raise ImportError(
+        f"Could not import sentiment_analysis from any known path. "
+        f"Tried: {candidates}. Last error: {last_exc}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
