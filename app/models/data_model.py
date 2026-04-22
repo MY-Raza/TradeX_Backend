@@ -31,10 +31,10 @@ from sqlalchemy import (
 # ---------------------------------------------------------------------------
 
 EXCHANGE_SCHEMA_MAP: dict[str, str] = {
-    "binance":      "binance_data",
-    "bybit":        "bybit_data",
-    "kraken":       "kraken_data",
-    "metatrader5":  "mt5_data",
+    "binance":      "data_binance",
+    "bybit":        "data_bybit",
+    "kraken":       "data_kraken",
+    "metatrader5":  "data_mt5",
 }
 
 # ---------------------------------------------------------------------------
@@ -134,8 +134,7 @@ def get_ohlcv_table(schema: str, table_name: str) -> Table:
     return Table(
         table_name,
         meta,
-        Column("id",       Integer,              primary_key=True),
-        Column("datetime", DateTime(timezone=True), nullable=False),
+        Column("datetime", DateTime(timezone=True), primary_key=True, nullable=False),
         Column("open",     Float,                nullable=False),
         Column("high",     Float,                nullable=False),
         Column("low",      Float,                nullable=False),

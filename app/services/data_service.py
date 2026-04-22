@@ -1,3 +1,14 @@
+"""
+TradeX – Data Service
+
+Responsibilities
+----------------
+1. Return exchange list and per-exchange coin list (static catalogue)
+2. Run the correct fetcher in a thread-pool worker (non-blocking)
+3. Read OHLCV candles from the DB and resample to the requested timeframe
+4. Return chart-ready OHLCVCandle objects to the router
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -111,6 +122,8 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
     Returns the number of rows saved (best-effort; falls back to 0).
     """
     exchange = req.exchange.lower()
+    # Normalize symbol: "btc/usdt" → "btc"
+    symbol = req.symbol.lower().split("/")[0].split("-")[0].strip()
 
     # ── Resolve fetcher class ────────────────────────────────────────────
     if exchange == "binance":
@@ -119,13 +132,13 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
         from TradeX.utils.data.data_cleaner import clean_df
 
         schema = EXCHANGE_SCHEMA_MAP["binance"]
-        last = get_last_date(f"{req.symbol}_1m", schema, "datetime")
+        last = get_last_date(f"{symbol}_1m", schema, "datetime")
         start = (
             (last + pd.Timedelta(milliseconds=1)).strftime("%Y-%m-%d %H:%M:%S")
             if last else req.start_date
         )
         fetcher = BinanceFuturesFetcher(
-            symbol=f"{req.symbol.upper()}USDT",
+            symbol=f"{symbol.upper()}USDT",
             start_date=start,
             end_date=req.end_date,
             interval="1m",
@@ -134,7 +147,7 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
         if raw_df.empty:
             return 0
         df = clean_df(raw_df)
-        save_df_to_db(df, f"{req.symbol}_1m", schema, "datetime", is_timeseries=True)
+        save_df_to_db(df, f"{symbol}_1m", schema, "datetime", is_timeseries=True)
         return len(df)
 
     elif exchange == "bybit":
@@ -143,13 +156,13 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
         from TradeX.utils.data.data_cleaner import clean_df
 
         schema = EXCHANGE_SCHEMA_MAP["bybit"]
-        last = get_last_date(f"{req.symbol}_1m", schema, "datetime")
+        last = get_last_date(f"{symbol}_1m", schema, "datetime")
         start = (
             (last + pd.Timedelta(milliseconds=1)).strftime("%Y-%m-%d %H:%M:%S")
             if last else req.start_date
         )
         fetcher = BybitFuturesFetcher(
-            symbol=f"{req.symbol.upper()}USDT",
+            symbol=f"{symbol.upper()}USDT",
             start_date=start,
             end_date=req.end_date,
             interval="1",
@@ -158,7 +171,7 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
         if raw_df.empty:
             return 0
         df = clean_df(raw_df)
-        save_df_to_db(df, f"{req.symbol}_1m", schema, "datetime", is_timeseries=True)
+        save_df_to_db(df, f"{symbol}_1m", schema, "datetime", is_timeseries=True)
         return len(df)
 
     elif exchange == "kraken":
@@ -167,18 +180,18 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
         from TradeX.utils.data.data_cleaner import clean_df
 
         schema = EXCHANGE_SCHEMA_MAP["kraken"]
-        last = get_last_date(f"{req.symbol}_1m", schema, "datetime")
+        last = get_last_date(f"{symbol}_1m", schema, "datetime")
         start = (
             (last + pd.Timedelta(milliseconds=1)).strftime("%Y-%m-%d %H:%M:%S")
             if last else req.start_date
         )
-        kraken_symbol = f"PF_{req.symbol.upper()}USD"
+        kraken_symbol = f"PF_{symbol.upper()}USD"
         fetcher = KrakenFuturesFetcher(symbol=kraken_symbol, interval="1m")
         raw_df = fetcher.fetch_data(start_date=start, end_date=req.end_date)
         if raw_df.empty:
             return 0
         df = clean_df(raw_df)
-        save_df_to_db(df, f"{req.symbol}_1m", schema, "datetime", is_timeseries=True)
+        save_df_to_db(df, f"{symbol}_1m", schema, "datetime", is_timeseries=True)
         return len(df)
 
     elif exchange == "metatrader5":
@@ -196,7 +209,7 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
             raise RuntimeError(f"MT5 init failed: {mt5_lib.last_error()}")
 
         schema = EXCHANGE_SCHEMA_MAP["metatrader5"]
-        last   = get_last_date(f"{req.symbol}_1m", schema, "datetime")
+        last   = get_last_date(f"{symbol}_1m", schema, "datetime")
         utc_from = (
             (last + pd.Timedelta(milliseconds=1)).to_pydatetime()
             if last
@@ -208,17 +221,17 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
             else datetime.fromisoformat(req.end_date)
         )
         fetcher = MetaTrader5FutureFetcher(
-            symbols=[req.symbol],
+            symbols=[symbol],
             utc_from=utc_from,
             utc_to=utc_to,
             timeframe=mt5_lib.TIMEFRAME_M1,
         )
-        raw_df = fetcher.fetch(req.symbol)
+        raw_df = fetcher.fetch(symbol)
         mt5_lib.shutdown()
         if raw_df is None or raw_df.empty:
             return 0
         df = clean_df(raw_df, "1m")
-        save_df_to_db(df, f"{req.symbol}_1m", schema, "datetime", is_timeseries=True)
+        save_df_to_db(df, f"{symbol}_1m", schema, "datetime", is_timeseries=True)
         return len(df)
 
     else:
@@ -243,7 +256,8 @@ async def read_ohlcv(
     and return chart-ready data.
     """
     exchange = exchange.lower()
-    symbol   = symbol.lower()
+    # Normalize: "btc/usdt" or "BTC/USDT" → "btc"
+    symbol = symbol.lower().split("/")[0].split("-")[0].strip()
 
     # Validate inputs
     if exchange not in EXCHANGE_SCHEMA_MAP:
@@ -292,7 +306,7 @@ async def read_ohlcv(
         )
 
     # ── Build DataFrame ───────────────────────────────────────────────────
-    df = pd.DataFrame(rows, columns=["id", "datetime", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.sort_values("datetime").set_index("datetime")
 
