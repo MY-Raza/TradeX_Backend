@@ -82,7 +82,7 @@ def _safe_int(val) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Table existence check  (uses information_schema — avoids reflect overhead)
+# Table existence check
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _table_exists(db: AsyncSession, schema: str, table: str) -> bool:
@@ -125,7 +125,7 @@ def _shape_comments(rows) -> list[SentimentComment]:
         score = _safe_int(r.sentiment_score)
         out.append(SentimentComment(
             id           = str(r.comment_id),
-            text         = str(r.comment_text or "")[:300],   # truncate for frontend
+            text         = str(r.comment_text or "")[:300],
             author       = str(r.comment_author or ""),
             upvotes      = _safe_int(r.comment_score),
             sentiment    = LABEL_MAP.get(score, "Neutral"),
@@ -172,28 +172,25 @@ def _overall_stats(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DB fetch  (uses Table() objects from sentiment_model.py)
+# DB fetch  — sequential queries on a single session (asyncpg requirement)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _fetch_results(db: AsyncSession, coin: str) -> SentimentResultsResponse:
     """
-    Read all four sentiment tables for the given coin using SQLAlchemy Table()
-    objects and build the response. Raises HTTP 404 if any table is missing.
+    Read all four sentiment tables for the given coin sequentially.
+
+    asyncpg does NOT support concurrent queries on the same connection, so we
+    deliberately avoid asyncio.gather() here and await each query one at a time.
+    Attempting to run them concurrently causes:
+        InterfaceError: cannot perform operation: another operation is in progress
     """
     tbl_posts    = get_posts_sentiment_table(coin)
     tbl_comments = get_comments_sentiment_table(coin)
     tbl_ph       = get_posts_hourly_table(coin)
     tbl_ch       = get_comments_hourly_table(coin)
 
-    table_map = {
-        tbl_posts.name:    tbl_posts,
-        tbl_comments.name: tbl_comments,
-        tbl_ph.name:       tbl_ph,
-        tbl_ch.name:       tbl_ch,
-    }
-
-    # Verify all four tables exist before querying
-    for tbl_name in table_map:
+    # ── 1. Verify all four tables exist (one check at a time) ─────────────────
+    for tbl_name in (tbl_posts.name, tbl_comments.name, tbl_ph.name, tbl_ch.name):
         if not await _table_exists(db, SCHEMA, tbl_name):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -203,19 +200,21 @@ async def _fetch_results(db: AsyncSession, coin: str) -> SentimentResultsRespons
                 ),
             )
 
-    # Execute all four selects concurrently
-    (
-        posts_result,
-        comments_result,
-        ph_result,
-        ch_result,
-    ) = await asyncio.gather(
-        db.execute(select(tbl_posts).order_by(   tbl_posts.c.post_time.desc())),
-        db.execute(select(tbl_comments).order_by(tbl_comments.c.comment_time.desc())),
-        db.execute(select(tbl_ph).order_by(      tbl_ph.c.time_window.asc())),
-        db.execute(select(tbl_ch).order_by(      tbl_ch.c.time_window.asc())),
+    # ── 2. Query each table sequentially (one await at a time) ───────────────
+    posts_result    = await db.execute(
+        select(tbl_posts).order_by(tbl_posts.c.post_time.desc())
+    )
+    comments_result = await db.execute(
+        select(tbl_comments).order_by(tbl_comments.c.comment_time.desc())
+    )
+    ph_result       = await db.execute(
+        select(tbl_ph).order_by(tbl_ph.c.time_window.asc())
+    )
+    ch_result       = await db.execute(
+        select(tbl_ch).order_by(tbl_ch.c.time_window.asc())
     )
 
+    # ── 3. Shape into Pydantic models ─────────────────────────────────────────
     posts    = _shape_posts(   posts_result.mappings().all())
     comments = _shape_comments(comments_result.mappings().all())
     hourly_p = _shape_hourly(  ph_result.mappings().all())
@@ -265,28 +264,22 @@ def _run_scraper() -> None:
 def _run_sentiment_pipeline(coin: str) -> None:
     """
     Execute the FinBERT sentiment pipeline for the given coin.
-    Designed to be called via asyncio.to_thread().
-
-    Tries multiple known module paths for sentiment_analysis so the service
-    works regardless of whether it is run from inside the app package or the
-    project root.
+    Tries multiple known module paths so it works regardless of project layout.
     """
     import importlib
     import os
     import sys
 
-    # Make sure the project root is on sys.path
     project_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..")
     )
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    # Candidate module paths – tried in order; first successful import wins.
     candidates = [
-        "TradeX.sentiments.sentiment_analysis",   # TradeX/sentiments/sentiment_analysis.py
-        "TradeX.sentiments.data.sentiment_analysis",  # TradeX/sentiments/data/sentiment_analysis.py
-        "app.services.sentiment_analysis",        # app/services/sentiment_analysis.py  (fallback)
+        "TradeX.sentiments.sentiment_analysis",
+        "TradeX.sentiments.data.sentiment_analysis",
+        "app.services.sentiment_analysis",
     ]
 
     last_exc = None
@@ -294,12 +287,10 @@ def _run_sentiment_pipeline(coin: str) -> None:
         try:
             mod = importlib.import_module(module_path)
             mod.run_pipeline(coin=coin, apply_coin_filter=True, save_to_database=True)
-            return   # success — stop trying
+            return
         except ModuleNotFoundError as exc:
             last_exc = exc
-            continue  # try next candidate
-        # Any other exception (e.g. runtime error inside pipeline) should propagate
-        # immediately — don't swallow it.
+            continue
 
     raise ImportError(
         f"Could not import sentiment_analysis from any known path. "
@@ -328,7 +319,7 @@ async def run_sentiment(
       1. Validate coin against COIN_CONFIG
       2. Run Reddit scraper in thread pool  (non-blocking)
       3. Run FinBERT pipeline for selected coin in thread pool  (non-blocking)
-      4. Read results from DB via SQLAlchemy Table() objects
+      4. Read results from DB sequentially via SQLAlchemy Table() objects
       5. Return SentimentRunResponse
     """
     coin = req.coin.lower()
@@ -380,7 +371,6 @@ async def get_sentiment_results(
 ) -> SentimentResultsResponse:
     """
     Return cached sentiment results from the DB without re-running the pipeline.
-    Used by the frontend to populate the tab on revisit / coin switch.
     """
     coin = coin.lower()
 
