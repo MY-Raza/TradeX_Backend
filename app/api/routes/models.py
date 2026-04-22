@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.schemas.model_schema import (
+    AllModelsResponse,
     ModelResultDetail,
     ModelTypeOptions,
     PaginatedModelResults,
@@ -17,6 +18,23 @@ router = APIRouter(prefix="/models", tags=["Models"])
 
 # Reusable type alias for the DB dependency
 DB = Annotated[AsyncSession, Depends(get_db)]
+
+
+# ===========================================================================
+# GET /models   ← returns ALL models from both ml_results and dl_results
+# ===========================================================================
+
+@router.get(
+    "",
+    response_model=AllModelsResponse,
+    summary="Get all models",
+    description=(
+        "Returns every row from both **ml_results** and **dl_results** tables "
+        "in a single response, grouped by type."
+    ),
+)
+async def get_all_models(db: DB) -> AllModelsResponse:
+    return await model_service.get_all_models(db)
 
 
 # ===========================================================================

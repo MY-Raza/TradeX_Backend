@@ -97,3 +97,20 @@ class ModelTypeOptions(BaseModel):
         default=["ml", "dl"],
         description="Available model type identifiers",
     )
+
+
+# ===========================================================================
+# All models combined  (used by GET /models)
+# ===========================================================================
+
+class AllModelsResponse(BaseModel):
+    ml: list[ModelResultListItem] = Field(
+        default_factory=list,
+        description="All ML model results",
+    )
+    dl: list[ModelResultListItem] = Field(
+        default_factory=list,
+        description="All DL model results",
+    )
+    total_ml: int = Field(..., description="Total ML model count")
+    total_dl: int = Field(..., description="Total DL model count")

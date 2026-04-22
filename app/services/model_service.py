@@ -150,6 +150,24 @@ async def get_model_result_by_name(
     return _to_detail(row) if row else None
 
 
+async def get_all_models(db: AsyncSession) -> "AllModelsResponse":
+    """
+    Return every row from both ml_results and dl_results in one response.
+    No pagination — designed for the /models overview endpoint.
+    """
+    from app.schemas.model_schema import AllModelsResponse
+
+    ml_rows = (await db.execute(select(MLResult).order_by(MLResult.model_name))).scalars().all()
+    dl_rows = (await db.execute(select(DLResult).order_by(DLResult.model_name))).scalars().all()
+
+    return AllModelsResponse(
+        ml=[_to_list_item(r) for r in ml_rows],
+        dl=[_to_list_item(r) for r in dl_rows],
+        total_ml=len(ml_rows),
+        total_dl=len(dl_rows),
+    )
+
+
 async def get_model_type_options() -> ModelTypeOptions:
     """
     Return the available model type identifiers.
