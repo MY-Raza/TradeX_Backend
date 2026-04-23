@@ -81,7 +81,6 @@ def get_posts_sentiment_table(coin: str) -> Table:
         Column("simhash",               String,                  nullable=True),   # uint64 stored as str
         Column("had_url",               Boolean,                 nullable=True),
         Column("had_bot_content",       Boolean,                 nullable=True),
-        Column("had_markdown",          Boolean,                 nullable=True),
         # ── FinBERT sentiment output ──────────────────────────────────────
         Column("sentiment_score",       SmallInteger,            nullable=True),   # -1 | 0 | 1
         Column("sentiment_confidence",  Float,                   nullable=True),   # [0, 1]
@@ -134,7 +133,6 @@ def get_comments_sentiment_table(coin: str) -> Table:
         Column("simhash",               String,                  nullable=True),
         Column("had_url",               Boolean,                 nullable=True),
         Column("had_bot_content",       Boolean,                 nullable=True),
-        Column("had_markdown",          Boolean,                 nullable=True),
         # ── FinBERT sentiment output ──────────────────────────────────────
         Column("sentiment_score",       SmallInteger,            nullable=True),
         Column("sentiment_confidence",  Float,                   nullable=True),
