@@ -237,7 +237,8 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported exchange '{exchange}'.",
+            detail=f"MetaTrader5 is not supported in the cloud deployment. "
+               "Run the backend locally to use MT5.",
         )
 
 
