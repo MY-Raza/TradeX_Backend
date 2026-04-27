@@ -15,14 +15,9 @@ settings = get_settings()
 
 # ── Convert any sync URL variant → asyncpg URL ────────────────────────────
 def _make_async_url(url: str) -> str:
-    """
-    Normalise any PostgreSQL URL variant to postgresql+asyncpg://.
-    Handles:
-      postgresql://...       (standard)
-      postgres://...         (Heroku / Render / some Railway configs)
-      postgresql+psycopg2:// (sync driver explicit)
-      postgresql+asyncpg://  (already correct – pass through)
-    """
+    # Strip sslmode=require — asyncpg doesn't understand it
+    url = url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+
     replacements = [
         ("postgresql+psycopg2://", "postgresql+asyncpg://"),
         ("postgresql+psycopg://",  "postgresql+asyncpg://"),
@@ -32,7 +27,7 @@ def _make_async_url(url: str) -> str:
     for old, new in replacements:
         if url.startswith(old):
             return url.replace(old, new, 1)
-    return url  # already correct or unknown scheme – let SQLAlchemy raise
+    return url
 
 _async_url = _make_async_url(settings.DATABASE_URL)
 
@@ -44,6 +39,7 @@ engine = create_async_engine(
     pool_pre_ping=settings.DB_POOL_PRE_PING,
     echo=settings.DEBUG,
     future=True,
+    connect_args={"ssl": "require"},  # Supabase requires SSL — asyncpg syntax
 )
 
 # ── Session factory ────────────────────────────────────────────────────────
