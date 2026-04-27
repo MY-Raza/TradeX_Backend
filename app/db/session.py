@@ -13,15 +13,28 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# ── Convert sync URL → async URL if caller forgot the driver prefix ────────
-_raw_url: str = settings.DATABASE_URL
-if _raw_url.startswith("postgresql://") and "+asyncpg" not in _raw_url:
-    _async_url = _raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-elif _raw_url.startswith("postgres://"):
-    # Some cloud providers (Heroku/Render) emit postgres:// without +asyncpg
-    _async_url = _raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
-else:
-    _async_url = _raw_url
+# ── Convert any sync URL variant → asyncpg URL ────────────────────────────
+def _make_async_url(url: str) -> str:
+    """
+    Normalise any PostgreSQL URL variant to postgresql+asyncpg://.
+    Handles:
+      postgresql://...       (standard)
+      postgres://...         (Heroku / Render / some Railway configs)
+      postgresql+psycopg2:// (sync driver explicit)
+      postgresql+asyncpg://  (already correct – pass through)
+    """
+    replacements = [
+        ("postgresql+psycopg2://", "postgresql+asyncpg://"),
+        ("postgresql+psycopg://",  "postgresql+asyncpg://"),
+        ("postgresql://",          "postgresql+asyncpg://"),
+        ("postgres://",            "postgresql+asyncpg://"),
+    ]
+    for old, new in replacements:
+        if url.startswith(old):
+            return url.replace(old, new, 1)
+    return url  # already correct or unknown scheme – let SQLAlchemy raise
+
+_async_url = _make_async_url(settings.DATABASE_URL)
 
 # ── Engine ─────────────────────────────────────────────────────────────────
 engine = create_async_engine(
@@ -29,7 +42,7 @@ engine = create_async_engine(
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,
     pool_pre_ping=settings.DB_POOL_PRE_PING,
-    echo=settings.DEBUG,           # logs SQL in development
+    echo=settings.DEBUG,
     future=True,
 )
 
@@ -37,25 +50,19 @@ engine = create_async_engine(
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
-    expire_on_commit=False,        # keeps objects usable after commit
+    expire_on_commit=False,
     autocommit=False,
     autoflush=False,
 )
 
 
-# ── Declarative Base (imported by all models) ──────────────────────────────
+# ── Declarative Base ───────────────────────────────────────────────────────
 class Base(DeclarativeBase):
     pass
 
 
 # ── FastAPI dependency ─────────────────────────────────────────────────────
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Yield an AsyncSession per request and guarantee cleanup.
-
-    Usage in a route:
-        async def my_route(db: AsyncSession = Depends(get_db)): ...
-    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
