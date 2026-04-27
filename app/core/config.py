@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql://postgres:y2s57r29a@localhost:5432/TradeX"
+    DATABASE_URL: str = "postgresql://postgres:KingRazaYasir@db.tdkfbyrwcglncohzlhzf.supabase.co:5432/postgres?sslmode=require"
 
     # ── SQLAlchemy pool ───────────────────────────────────────────────────
     DB_POOL_SIZE: int = 5
