@@ -15,7 +15,6 @@ settings = get_settings()
 
 # ── Convert any sync URL variant → asyncpg URL ────────────────────────────
 def _make_async_url(url: str) -> str:
-    # Strip sslmode=require — asyncpg doesn't understand it
     url = url.replace("?sslmode=require", "").replace("&sslmode=require", "")
 
     replacements = [
@@ -40,7 +39,10 @@ engine = create_async_engine(
     pool_pre_ping=settings.DB_POOL_PRE_PING,
     echo=settings.DEBUG,
     future=True,
-    connect_args={"ssl": "require"},  # Supabase requires SSL — asyncpg syntax
+    connect_args={
+        "ssl": "require",
+        "statement_cache_size": 0,  # required for Supabase PgBouncer pooler
+    },
 )
 
 # ── Session factory ────────────────────────────────────────────────────────

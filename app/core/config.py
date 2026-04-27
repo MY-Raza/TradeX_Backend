@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql://postgres:KingRazaYasir@db.tdkfbyrwcglncohzlhzf.supabase.co:5432/postgres"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres.tdkfbyrwcglncohzlhzf:KingRazaYasir@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres"
 
     # ── SQLAlchemy pool ───────────────────────────────────────────────────
     DB_POOL_SIZE: int = 5
