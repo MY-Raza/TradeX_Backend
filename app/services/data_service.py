@@ -33,6 +33,7 @@ from app.schemas.data_schema import (
     ExchangeInfo,
     FetchRequest,
     FetchResponse,
+    LastDateResponse,
     OHLCVCandle,
     OHLCVResponse,
 )
@@ -240,6 +241,44 @@ def _run_fetcher_sync(req: FetchRequest) -> int:
             detail=f"MetaTrader5 is not supported in the cloud deployment. "
                "Run the backend locally to use MT5.",
         )
+
+
+# ===========================================================================
+# Last-date query  (used by frontend to pre-fill start_date)
+# ===========================================================================
+
+async def get_last_date_for_coin(
+    db: AsyncSession,
+    exchange: str,
+    symbol: str,
+) -> LastDateResponse:
+    """
+    Return the most recent stored datetime for a given exchange/symbol pair.
+    If no data exists, last_date is None (frontend treats this as "user can pick date").
+    """
+    exchange = exchange.lower()
+    symbol   = symbol.lower().split("/")[0].split("-")[0].strip()
+
+    if exchange not in EXCHANGE_SCHEMA_MAP:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown exchange '{exchange}'.",
+        )
+
+    schema     = EXCHANGE_SCHEMA_MAP[exchange]
+    table_name = f"{symbol}_1m"
+    tbl        = get_ohlcv_table(schema, table_name)
+
+    try:
+        stmt   = select(tbl.c.datetime).order_by(tbl.c.datetime.desc()).limit(1)
+        result = await db.execute(stmt)
+        row    = result.fetchone()
+    except Exception:
+        # Table doesn't exist yet — normal case before first fetch
+        return LastDateResponse(exchange=exchange, symbol=symbol, last_date=None)
+
+    last_date = row[0].isoformat() if row else None
+    return LastDateResponse(exchange=exchange, symbol=symbol, last_date=last_date)
 
 
 # ===========================================================================

@@ -22,6 +22,7 @@ from app.schemas.data_schema import (
     ExchangeInfo,
     FetchRequest,
     FetchResponse,
+    LastDateResponse,
     OHLCVResponse,
 )
 from app.services import data_service
@@ -68,6 +69,34 @@ async def list_exchanges() -> list[ExchangeInfo]:
 )
 async def list_coins(exchange: str) -> list[CoinInfo]:
     return data_service.get_coins(exchange)
+
+
+# ===========================================================================
+# GET /data/last-date
+# ===========================================================================
+
+@router.get(
+    "/last-date",
+    response_model=LastDateResponse,
+    summary="Get the last stored candle datetime for a coin",
+    description=(
+        "Returns the most recent stored candle datetime for the given exchange "
+        "and symbol. If no data exists yet, `last_date` is null. "
+        "The frontend uses this to pre-fill the start_date field and to "
+        "decide whether to lock the date picker."
+    ),
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Unknown exchange id supplied.",
+        }
+    },
+)
+async def get_last_date(
+    db: DB,
+    exchange: Annotated[str, Query(description="Exchange id, e.g. 'binance'")],
+    symbol:   Annotated[str, Query(description="Coin symbol key, e.g. 'btc'")],
+) -> LastDateResponse:
+    return await data_service.get_last_date_for_coin(db, exchange, symbol)
 
 
 # ===========================================================================

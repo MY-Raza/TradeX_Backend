@@ -68,6 +68,19 @@ class FetchResponse(BaseModel):
 
 
 # ===========================================================================
+# Last date response  (GET /data/last-date)
+# ===========================================================================
+
+class LastDateResponse(BaseModel):
+    exchange: str
+    symbol: str
+    last_date: Optional[str] = Field(
+        None,
+        description="ISO-8601 datetime string of the last stored candle, or null if no data exists.",
+    )
+
+
+# ===========================================================================
 # OHLCV candle  (one row for the chart)
 # ===========================================================================
 
