@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import logging
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
@@ -30,6 +30,7 @@ def _make_async_url(url: str) -> str:
     return url
 
 _async_url = _make_async_url(settings.DATABASE_URL)
+logging.warning(f"[DEBUG] Async URL being used: {_async_url}")
 
 # ── Engine ─────────────────────────────────────────────────────────────────
 engine = create_async_engine(
