@@ -36,7 +36,7 @@ from app.models.sentiment_model import (
     get_posts_hourly_table,
     get_comments_hourly_table,
 )
-from TradeX.TradeX.sentiments.sentiment_analysis import COIN_CONFIG
+from TradeX.sentiments.sentiment_analysis import COIN_CONFIG
 from app.schemas.sentiment_schema import (
     CoinOption,
     HourlyPoint,
