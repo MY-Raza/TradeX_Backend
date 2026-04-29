@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Install Tailscale
+RUN curl -fsSL https://tailscale.com/install.sh | sh
+
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
