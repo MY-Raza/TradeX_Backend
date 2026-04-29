@@ -40,9 +40,10 @@ engine = create_async_engine(
     echo=settings.DEBUG,
     future=True,
     connect_args={
-        "ssl": "require",
+        "ssl": False,
         "statement_cache_size": 0,
-        "timeout": 30
+        "timeout": 30,
+        "server_settings": {"application_name": "railway-backend"}
     },
 )
 
