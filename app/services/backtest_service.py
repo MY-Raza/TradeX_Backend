@@ -121,7 +121,9 @@ async def _load_price_df(
 
     tbl = get_price_table(schema, symbol)
     try:
-        result = await db.execute(select(tbl).order_by(tbl.c.datetime))
+        # Fetch first 43200 rows (30 days of 1m candles) in chronological order
+        stmt = select(tbl).order_by(tbl.c.datetime.asc()).limit(43200)
+        result = await db.execute(stmt)
         rows = result.fetchall()
     except Exception as exc:
         raise HTTPException(
@@ -149,7 +151,9 @@ async def _load_predictions_df(
     """Read predictions from strategies.<strategy_name>."""
     tbl = get_predictions_table(strategy_name)
     try:
-        result = await db.execute(select(tbl).order_by(tbl.c.datetime))
+        # Fetch first 43200 rows in chronological order to match price data
+        stmt = select(tbl).order_by(tbl.c.datetime.asc()).limit(43200)
+        result = await db.execute(stmt)
         rows = result.fetchall()
     except Exception as exc:
         raise HTTPException(
