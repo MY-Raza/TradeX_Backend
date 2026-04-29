@@ -29,3 +29,5 @@ echo ">>> TCP tunnels established: async=5433, sync=5434"
 
 echo ">>> Starting uvicorn..."
 exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+
+
