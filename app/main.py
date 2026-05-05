@@ -1,9 +1,46 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import strategies, models, data, backtest, sentiment
+from sqlalchemy import text
 import os
 
-app = FastAPI(title="TradeX API")
+from app.api.routes import strategies, models, data, backtest, sentiment
+from app.db.session import get_db
+
+
+# ---------------------------------------------------------------------------
+# Startup: add the three "last run" columns to strategy_registry if missing.
+# The CSV / DB table was created without them; they are only written by
+# backtest_service after a run — but every GET /backtest/strategies and
+# GET /strategies call tries to SELECT them, which crashes until they exist.
+# Using IF NOT EXISTS makes this completely safe to run on every deploy.
+# ---------------------------------------------------------------------------
+
+async def _ensure_strategy_columns() -> None:
+    async for db in get_db():
+        try:
+            for col_def in [
+                "ADD COLUMN IF NOT EXISTS last_pnl_pct DOUBLE PRECISION",
+                "ADD COLUMN IF NOT EXISTS last_run_tp  DOUBLE PRECISION",
+                "ADD COLUMN IF NOT EXISTS last_run_sl  DOUBLE PRECISION",
+            ]:
+                await db.execute(
+                    text(f"ALTER TABLE strategies.strategy_registry {col_def}")
+                )
+            await db.commit()
+            print("[startup] strategy_registry columns ensured OK")
+        except Exception as exc:
+            print(f"[startup] Could not alter strategy_registry: {exc}")
+            await db.rollback()
+        break  # get_db is a generator — only need one session
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _ensure_strategy_columns()
+    yield
+
+app = FastAPI(title="TradeX API", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # CORS – explicit origins + regex to cover all Vercel preview deployments
