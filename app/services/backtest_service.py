@@ -45,8 +45,6 @@ from app.models.backtest_model import (
     RUN_REGISTRY_TABLE,
     extract_symbol_from_strategy,
     get_ledger_run_table,
-    get_predictions_table,
-    get_price_table,
 )
 from app.models.data_model import EXCHANGE_SCHEMA_MAP
 from app.schemas.backtest_schema import (
@@ -177,61 +175,44 @@ async def get_backtest_strategies(db: AsyncSession) -> list[BacktestStrategyOpti
 
 # ===========================================================================
 # 2. Load price DataFrame (date-filtered)
+# Runs synchronously inside asyncio.to_thread — uses fetch_ohlcv_df which
+# handles UTC-aware timestamps correctly, avoiding the tz-naive asyncpg error.
 # ===========================================================================
 
-async def _load_price_df(
-    db: AsyncSession,
+def _load_price_df_sync(
     exchange: str,
     symbol: str,
     start_date: Optional[str],
     end_date: Optional[str],
 ) -> pd.DataFrame:
+    from TradeX.utils.db.utils import fetch_ohlcv_df
+
     schema = EXCHANGE_SCHEMA_MAP.get(exchange.lower())
     if not schema:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown exchange '{exchange}'. "
-                   f"Valid: {list(EXCHANGE_SCHEMA_MAP.keys())}",
+        raise ValueError(
+            f"Unknown exchange '{exchange}'. "
+            f"Valid: {list(EXCHANGE_SCHEMA_MAP.keys())}"
         )
 
-    tbl = get_price_table(schema, symbol)
-    stmt = select(tbl).order_by(tbl.c.datetime.asc())
+    df = fetch_ohlcv_df(
+        table_name=f"{symbol}_1m",
+        schema=schema,
+        time_column="datetime",
+        start_date=start_date or None,
+        end_date=end_date or None,
+        limit=43200 if (not start_date and not end_date) else None,
+    )
 
-    # Apply date filters when provided
-    if start_date:
-        try:
-            stmt = stmt.where(tbl.c.datetime >= pd.Timestamp(start_date))
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"Invalid start_date: '{start_date}'")
-    if end_date:
-        try:
-            stmt = stmt.where(tbl.c.datetime <= pd.Timestamp(end_date))
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"Invalid end_date: '{end_date}'")
-
-    # Cap at 43 200 rows (30 days × 1 440 min) when no explicit range is set
-    if not start_date and not end_date:
-        stmt = stmt.limit(43200)
-
-    try:
-        result = await db.execute(stmt)
-        rows = result.fetchall()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Price table '{schema}.{symbol}_1m' not found. "
-                   f"Fetch data first from the Data tab. Detail: {exc}",
+    if df.empty:
+        raise ValueError(
+            f"No price data found for {symbol} on {exchange} "
+            f"in the selected date range. Fetch data first from the Data tab."
         )
 
-    if not rows:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No price data found for {symbol} on {exchange} "
-                   f"in the selected date range.",
-        )
+    # Strip timezone so downstream BackTest / numpy code stays tz-naive
+    if pd.api.types.is_datetime64tz_dtype(df["datetime"]):
+        df["datetime"] = df["datetime"].dt.tz_localize(None)
 
-    df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close", "volume"])
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
     return df
 
 
@@ -576,12 +557,15 @@ async def run_backtest(
     if strategy_row.sl and req.stop_loss == 1.0:
         req.stop_loss = float(strategy_row.sl)
 
-    # ── Load price data ───────────────────────────────────────────────────
-    df_price = await _load_price_df(
-        db, req.exchange, symbol, req.start_date, req.end_date
-    )
+    # ── Load price data + run engine together in thread-pool ─────────────
+    # _load_price_df_sync uses fetch_ohlcv_df (UTC-aware, no asyncpg conflict)
+    try:
+        df_price = await asyncio.to_thread(
+            _load_price_df_sync, req.exchange, symbol, req.start_date, req.end_date
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
-    # ── Run engine (signals combiner + BackTest) in thread-pool ──────────
     try:
         df_ledger, final_balance, total_pnl_pct = await asyncio.to_thread(
             _run_engine_with_combiner, df_price, strategy_row, req
