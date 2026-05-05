@@ -86,138 +86,12 @@ def _streaks(wins: list[bool]) -> tuple[int, int]:
 
 
 # ===========================================================================
-# Helper: indicator / pattern column lists (mirrors strategy_service.py)
-# ===========================================================================
-
-_INDICATOR_COLUMNS: list[str] = [
-    "bbands", "dema", "ema", "ht_trendline", "kama", "ma", "mama",
-    "midpoint", "midprice", "sar", "sarext", "sma", "t3", "tema", "trima", "wma",
-    "adx", "adxr", "apo", "aroon", "aroonosc", "bop", "cci", "cmo", "dx",
-    "macd", "macdext", "mfi", "minus_di", "minus_dm", "mom",
-    "plus_di", "plus_dm", "ppo", "roc", "rocp", "rocr", "rocr100",
-    "rsi", "stoch", "stochf", "stochrsi", "trix", "willr",
-    "ad", "adosc", "obv",
-    "atr", "natr", "trange",
-    "avgprice", "medprice", "typprice", "wclprice",
-    "ht_dcperiod", "ht_dcphase", "ht_phasor", "ht_sine", "ht_trendmode",
-    "linearreg", "linearreg_angle", "linearreg_intercept", "linearreg_slope",
-    "stddev", "tsf", "var",
-    "ultosc",
-]
-
-_PATTERN_COLUMNS: list[str] = [
-    "cdl2crows", "cdl3blackcrows", "cdl3inside", "cdl3linestrike", "cdl3outside",
-    "cdl3starsinsouth", "cdl3whitesoldiers", "cdlabandonedbaby", "cdladvanceblock",
-    "cdlbelthold", "cdlbreakaway", "cdlclosingmarubozu", "cdlconcealbabyswall",
-    "cdlcounterattack", "cdldarkcloudcover", "cdldoji", "cdldojistar",
-    "cdldragonflydoji", "cdlengulfing", "cdleveningdojistar", "cdleveningstar",
-    "cdlgapsidesidewhite", "cdlgravestonedoji", "cdlhammer", "cdlhangingman",
-    "cdlharami", "cdlharamicross", "cdlhighwave", "cdlhikkake", "cdlhikkakemod",
-    "cdlhomingpigeon", "cdlidentical3crows", "cdlinneck", "cdlinvertedhammer",
-    "cdlkicking", "cdlkickingbylength", "cdlladderbottom", "cdllongleggeddoji",
-    "cdllongline", "cdlmarubozu", "cdlmatchinglow", "cdlmathold",
-    "cdlmorningdojistar", "cdlmorningstar", "cdlonneck", "cdlpiercing",
-    "cdlrickshawman", "cdlrisefall3methods", "cdlseparatinglines",
-    "cdlshootingstar", "cdlshortline", "cdlspinningtop", "cdlstalledpattern",
-    "cdlsticksandwich", "cdltakuri", "cdltasukigap", "cdlthrusting",
-    "cdltristar", "cdlunique3river", "cdlupsidegap2crows", "cdlxsidegap3methods",
-]
-
-# Maps each indicator → list of (param_label, db_column_name) tuples.
-# Matches INDICATOR_PERIOD_MAP in strategy_service.py exactly.
-_INDICATOR_PERIOD_MAP: dict[str, list[tuple[str, str]]] = {
-    "bbands":                [("period",       "bbands_period")],
-    "dema":                  [("period",       "dema_period")],
-    "ema":                   [("period",       "ema_period")],
-    "ht_trendline":          [],
-    "kama":                  [("period",       "kama_period")],
-    "ma":                    [("period",       "ma_period")],
-    "mama":                  [],
-    "midpoint":              [("period",       "midpoint_period")],
-    "midprice":              [("period",       "midprice_period")],
-    "sar":                   [],
-    "sarext":                [],
-    "sma":                   [("period",       "sma_period")],
-    "t3":                    [("period",       "t3_period")],
-    "tema":                  [("period",       "tema_period")],
-    "trima":                 [("period",       "trima_period")],
-    "wma":                   [("period",       "wma_period")],
-    "adx":                   [("period",       "adx_period")],
-    "adxr":                  [("period",       "adxr_period")],
-    "apo":                   [("period",       "apo_period")],
-    "aroon":                 [("period",       "aroon_period")],
-    "aroonosc":              [("period",       "aroonosc_period")],
-    "bop":                   [],
-    "cci":                   [("period",       "cci_period")],
-    "cmo":                   [("period",       "cmo_period")],
-    "dx":                    [("period",       "dx_period")],
-    "macd":                  [("fastperiod",   "macd_fastperiod"),
-                              ("slowperiod",   "macd_slowperiod"),
-                              ("signalperiod", "macd_signalperiod")],
-    "macdext":               [("fastperiod",   "macdext_fastperiod"),
-                              ("slowperiod",   "macdext_slowperiod"),
-                              ("signalperiod", "macdext_signalperiod")],
-    "mfi":                   [("period",       "mfi_period")],
-    "minus_di":              [("period",       "minus_di_period")],
-    "minus_dm":              [("period",       "minus_dm_period")],
-    "mom":                   [("period",       "mom_period")],
-    "plus_di":               [("period",       "plus_di_period")],
-    "plus_dm":               [("period",       "plus_dm_period")],
-    "ppo":                   [("fastperiod",   "ppo_fastperiod"),
-                              ("slowperiod",   "ppo_slowperiod")],
-    "roc":                   [("period",       "roc_period")],
-    "rocp":                  [("period",       "rocp_period")],
-    "rocr":                  [("period",       "rocr_period")],
-    "rocr100":               [("period",       "rocr100_period")],
-    "rsi":                   [("period",       "rsi_period")],
-    "stoch":                 [("fastk",        "stoch_fastk_period"),
-                              ("slowk",        "stoch_slowk_period"),
-                              ("slowd_period", "stoch_slowd_period")],
-    "stochf":                [("fastperiod",   "stochf_fastperiod"),
-                              ("slowperiod",   "stochf_slowperiod")],
-    "stochrsi":              [("period",       "stochrsi_period")],
-    "trix":                  [("period",       "trix_period")],
-    "willr":                 [("period",       "willr_period")],
-    "ad":                    [],
-    "adosc":                 [("fastperiod",   "adosc_fastperiod"),
-                              ("slowperiod",   "adosc_slowperiod")],
-    "obv":                   [],
-    "atr":                   [("period",       "atr_period")],
-    "natr":                  [("period",       "natr_period")],
-    "trange":                [],
-    "avgprice":              [],
-    "medprice":              [],
-    "typprice":              [],
-    "wclprice":              [],
-    "ht_dcperiod":           [],
-    "ht_dcphase":            [],
-    "ht_phasor":             [],
-    "ht_sine":               [],
-    "ht_trendmode":          [],
-    "linearreg":             [("period",       "linearreg_period")],
-    "linearreg_angle":       [("period",       "linearreg_angle_period")],
-    "linearreg_intercept":   [("period",       "linearreg_intercept_period")],
-    "linearreg_slope":       [("period",       "linearreg_slope_period")],
-    "stddev":                [("period",       "stddev_period")],
-    "tsf":                   [("period",       "tsf_period")],
-    "var":                   [("period",       "var_period")],
-    "ultosc":                [],
-}
-
-
-def _active_indicators(row: StrategyRegistry) -> list[str]:
-    """Return names of all indicator columns that are True on this row."""
-    return [col for col in _INDICATOR_COLUMNS if getattr(row, col, False)]
-
-
-def _active_patterns(row: StrategyRegistry) -> list[str]:
-    """Return names of all pattern columns that are True on this row."""
-    return [col for col in _PATTERN_COLUMNS if getattr(row, col, False)]
-
-
-# ===========================================================================
 # Helper: build indicator windows from DB-stored strategy params
 # ===========================================================================
+
+# All parameter column names that may exist on StrategyRegistry rows
+_WINDOW_PARAM_KEYS = ("slowperiod", "fastperiod", "timeperiod", "period",
+                      "fastk", "slowk", "signalperiod")
 
 
 def _build_windows_from_db(
@@ -225,24 +99,45 @@ def _build_windows_from_db(
     indicator_names: list[str],
 ) -> dict:
     """
-    Build the windows_override dict expected by run_active_signals_with_voting.
+    Read the window/parameter columns from the strategy_registry row and map
+    them back to indicator names.
 
-    Reads the per-indicator period columns directly from the ORM row using
-    _INDICATOR_PERIOD_MAP (e.g. rsi → rsi_period → {"period": 14}).
+    The strategy_registry is expected to carry JSONB / hstore columns like
+    ``indicator_params`` (dict[str, dict[str, int|None]]) built at strategy-
+    creation time.  If that attribute is absent we fall back to individual
+    columns (slowperiod, fastperiod, …).
 
-    Returns:  { indicator_name: { param_label: value, … }, … }
-    Only includes entries where at least one period value is non-null / non-zero.
+    Returns:  { indicator_name: { param_key: value, … }, … }
     """
     windows: dict = {}
-    for ind in indicator_names:
-        period_specs = _INDICATOR_PERIOD_MAP.get(ind, [])
-        params: dict = {}
-        for label, col in period_specs:
-            val = getattr(strategy_row, col, None)
-            if val is not None and val != 0:
-                params[label] = int(val)
-        if params:
-            windows[ind] = params
+
+    # ── Preferred path: indicator_params is a JSON column ─────────────────
+    raw_params = getattr(strategy_row, "indicator_params", None)
+    if raw_params and isinstance(raw_params, dict):
+        for ind in indicator_names:
+            if ind in raw_params and raw_params[ind]:
+                filtered = {
+                    k: v for k, v in raw_params[ind].items()
+                    if v not in (None, 0)
+                }
+                if filtered:
+                    windows[ind] = filtered
+        return windows
+
+    # ── Fallback: flat scalar columns on the row ───────────────────────────
+    flat_params: dict = {}
+    for key in _WINDOW_PARAM_KEYS:
+        val = getattr(strategy_row, key, None)
+        if val is not None and val != 0:
+            flat_params[key] = val
+
+    if flat_params:
+        # Apply the same flat params to every indicator that doesn't already
+        # have a dedicated entry (best-effort when metadata is minimal).
+        for ind in indicator_names:
+            if ind not in windows:
+                windows[ind] = flat_params
+
     return windows
 
 
@@ -376,8 +271,8 @@ def _run_engine_with_combiner(
     req: BacktestRunRequest,
 ) -> tuple[pd.DataFrame, float, float]:
     """
-    a. Build flags dict from the boolean indicator/pattern columns on the row.
-    b. Build windows dict from the per-indicator period columns on the row.
+    a. Build flags dict (all strategy indicators + patterns → True).
+    b. Build windows dict from DB-stored indicator parameters.
     c. Call signals_combiner.run_active_signals_with_voting().
     d. Pass resulting signals + price data into BackTest engine.
     Returns (df_ledger, final_balance, total_pnl_pct).
@@ -386,20 +281,19 @@ def _run_engine_with_combiner(
     from TradeX.backtest.backtest import BackTest
     from TradeX.strategy_generator.signals_combiner import run_active_signals_with_voting
 
-    # ── a. Build flags by inspecting the boolean columns on the ORM row ────
-    indicators: list[str] = _active_indicators(strategy_row)
-    patterns:   list[str] = _active_patterns(strategy_row)
+    # ── a. Build flags ──────────────────────────────────────────────────────
+    indicators: list[str] = list(getattr(strategy_row, "indicators", None) or [])
+    patterns:   list[str] = list(getattr(strategy_row, "patterns",   None) or [])
     all_signals = indicators + patterns
 
     if not all_signals:
         raise ValueError(
-            f"Strategy '{strategy_row.strategy}' has no indicators or patterns "
-            f"configured (all boolean flag columns are False/NULL)."
+            f"Strategy '{strategy_row.strategy}' has no indicators or patterns configured."
         )
 
     flags: dict[str, bool] = {name: True for name in all_signals}
 
-    # ── b. Build windows from per-indicator period columns on the row ───────
+    # ── b. Build windows ────────────────────────────────────────────────────
     windows_from_db = _build_windows_from_db(strategy_row, indicators)
 
     # ── c. Run signals combiner ─────────────────────────────────────────────
@@ -418,7 +312,6 @@ def _run_engine_with_combiner(
         close_=close_,
         volume=volume,
         timestamps=timestamps,
-        windows_override=windows_from_db,
     )
 
     if df_signals.empty:
@@ -477,42 +370,50 @@ async def _persist_run(
     """
     table_name = f"{strategy_name}_run_{run_index}"
 
-    # Ensure schema exists
-    await db.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
+    # ── DDL phase: create schema + tables and commit immediately ────────────
+    # These CREATE IF NOT EXISTS statements must run in their own committed
+    # transaction so that a later DML failure cannot roll them back and leave
+    # the session in an aborted state for the next request.
+    try:
+        await db.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
 
-    # Create run_registry if absent
-    await db.execute(text("""
-        CREATE TABLE IF NOT EXISTS backtest_runs.run_registry (
-            id            SERIAL PRIMARY KEY,
-            table_name    TEXT NOT NULL UNIQUE,
-            strategy_name TEXT NOT NULL,
-            exchange      TEXT NOT NULL,
-            start_date    TEXT,
-            end_date      TEXT,
-            take_profit   DOUBLE PRECISION NOT NULL,
-            stop_loss     DOUBLE PRECISION NOT NULL,
-            total_trades  INTEGER NOT NULL,
-            win_rate      DOUBLE PRECISION NOT NULL,
-            total_pnl_pct DOUBLE PRECISION NOT NULL,
-            final_balance DOUBLE PRECISION NOT NULL,
-            created_at    TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-    """))
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS backtest_runs.run_registry (
+                id            SERIAL PRIMARY KEY,
+                table_name    TEXT NOT NULL UNIQUE,
+                strategy_name TEXT NOT NULL,
+                exchange      TEXT NOT NULL,
+                start_date    TEXT,
+                end_date      TEXT,
+                take_profit   DOUBLE PRECISION NOT NULL,
+                stop_loss     DOUBLE PRECISION NOT NULL,
+                total_trades  INTEGER NOT NULL,
+                win_rate      DOUBLE PRECISION NOT NULL,
+                total_pnl_pct DOUBLE PRECISION NOT NULL,
+                final_balance DOUBLE PRECISION NOT NULL,
+                created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
 
-    # Create the individual ledger table
-    await db.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS backtest_runs."{table_name}" (
-            id                  SERIAL PRIMARY KEY,
-            datetime            TIMESTAMP NOT NULL,
-            action              TEXT NOT NULL,
-            buy_price           DOUBLE PRECISION,
-            sell_price          DOUBLE PRECISION,
-            pnl                 DOUBLE PRECISION,
-            pnl_sum             DOUBLE PRECISION,
-            balance             DOUBLE PRECISION NOT NULL,
-            predicted_direction TEXT NOT NULL
-        )
-    """))
+        await db.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS backtest_runs."{table_name}" (
+                id                  SERIAL PRIMARY KEY,
+                datetime            TIMESTAMP NOT NULL,
+                action              TEXT NOT NULL,
+                buy_price           DOUBLE PRECISION,
+                sell_price          DOUBLE PRECISION,
+                pnl                 DOUBLE PRECISION,
+                pnl_sum             DOUBLE PRECISION,
+                balance             DOUBLE PRECISION NOT NULL,
+                predicted_direction TEXT NOT NULL
+            )
+        """))
+
+        # Commit DDL immediately so it is never rolled back by a later error
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
     # Insert ledger rows in bulk
     if not df_ledger.empty:
@@ -568,17 +469,19 @@ async def _update_strategy_stats(
 ) -> None:
     """Persist last_pnl_pct, last_run_tp, last_run_sl back to strategy_registry."""
     try:
-        # Ensure columns exist (idempotent)
+        # Ensure columns exist (idempotent) – DDL committed immediately
         for col_def in [
             "ADD COLUMN IF NOT EXISTS last_pnl_pct  DOUBLE PRECISION",
             "ADD COLUMN IF NOT EXISTS last_run_tp   DOUBLE PRECISION",
             "ADD COLUMN IF NOT EXISTS last_run_sl   DOUBLE PRECISION",
         ]:
-            await db.execute(text(f"ALTER TABLE strategy_registry {col_def}"))
+            await db.execute(text(f"ALTER TABLE strategies.strategy_registry {col_def}"))
+        await db.commit()
 
+        # DML in its own transaction
         await db.execute(
             text("""
-                UPDATE strategy_registry
+                UPDATE strategies.strategy_registry
                    SET last_pnl_pct = :pnl,
                        last_run_tp  = :tp,
                        last_run_sl  = :sl
@@ -718,11 +621,15 @@ async def run_backtest(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     # ── Run engine (signals combiner + BackTest) in thread-pool ──────────
+    # The engine runs in a thread with no DB access, but any prior implicit
+    # transaction on the session must be clean before we reach _persist_run.
+    # Rollback on failure so the session is not left in an aborted state.
     try:
         df_ledger, final_balance, total_pnl_pct = await asyncio.to_thread(
             _run_engine_with_combiner, df_price, strategy_row, req
         )
     except Exception as exc:
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"BackTest engine failed: {exc}",
