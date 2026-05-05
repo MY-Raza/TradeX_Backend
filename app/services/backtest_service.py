@@ -174,9 +174,14 @@ async def get_backtest_strategies(db: AsyncSession) -> list[BacktestStrategyOpti
 
 
 # ===========================================================================
-# 2. Load price DataFrame (date-filtered)
-# Runs synchronously inside asyncio.to_thread — uses fetch_ohlcv_df which
-# handles UTC-aware timestamps correctly, avoiding the tz-naive asyncpg error.
+# 2. Load price DataFrame (date-filtered) – synchronous, runs in thread-pool
+#
+# The previous implementation used fetch_ohlcv_df which does SELECT * on the
+# full table and filters in Python — this kills the DB connection for large
+# tables.  We instead build a targeted query with SQL-level WHERE / LIMIT so
+# only the required rows travel over the wire.  Date strings are cast to
+# timestamptz inside the SQL string itself so psycopg2 never needs to convert
+# a Python Timestamp, avoiding the tz-naive asyncpg error entirely.
 # ===========================================================================
 
 def _load_price_df_sync(
@@ -185,7 +190,8 @@ def _load_price_df_sync(
     start_date: Optional[str],
     end_date: Optional[str],
 ) -> pd.DataFrame:
-    from TradeX.utils.db.utils import fetch_ohlcv_df
+    import os
+    import psycopg2
 
     schema = EXCHANGE_SCHEMA_MAP.get(exchange.lower())
     if not schema:
@@ -194,14 +200,49 @@ def _load_price_df_sync(
             f"Valid: {list(EXCHANGE_SCHEMA_MAP.keys())}"
         )
 
-    df = fetch_ohlcv_df(
-        table_name=f"{symbol}_1m",
-        schema=schema,
-        time_column="datetime",
-        start_date=start_date or None,
-        end_date=end_date or None,
-        limit=43200 if (not start_date and not end_date) else None,
+    table = f"{symbol}_1m"
+
+    # Build WHERE clauses — date strings are cast inside SQL so psycopg2
+    # never has to serialise a Python datetime/Timestamp object.
+    conditions: list[str] = []
+    params: list[str] = []
+
+    if start_date:
+        conditions.append("datetime >= %s::timestamptz")
+        params.append(str(start_date))
+    if end_date:
+        conditions.append("datetime <= %s::timestamptz")
+        params.append(str(end_date))
+
+    where_clause  = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    # Cap at 30 days of 1-min candles only when no explicit range is given
+    limit_clause  = "" if (start_date or end_date) else "LIMIT 43200"
+
+    sql = (
+        f"SELECT datetime, open, high, low, close, volume "
+        f'FROM {schema}."{table}" '
+        f"{where_clause} "
+        f"ORDER BY datetime ASC "
+        f"{limit_clause}"
+    ).strip()
+
+    # Resolve sync connection string — try common env-var names
+    dsn = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("DB_URL")
+        or os.environ.get("SYNC_DATABASE_URL")
     )
+    if not dsn:
+        raise ValueError(
+            "No sync database URL found in environment. "
+            "Set DATABASE_URL, DB_URL, or SYNC_DATABASE_URL."
+        )
+
+    conn = psycopg2.connect(dsn)
+    try:
+        df = pd.read_sql(sql, conn, params=params if params else None)
+    finally:
+        conn.close()
 
     if df.empty:
         raise ValueError(
@@ -209,10 +250,8 @@ def _load_price_df_sync(
             f"in the selected date range. Fetch data first from the Data tab."
         )
 
-    # Strip timezone so downstream BackTest / numpy code stays tz-naive
-    if pd.api.types.is_datetime64tz_dtype(df["datetime"]):
-        df["datetime"] = df["datetime"].dt.tz_localize(None)
-
+    # Drop timezone so downstream BackTest / numpy stays tz-naive
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
     return df
 
 
@@ -557,8 +596,7 @@ async def run_backtest(
     if strategy_row.sl and req.stop_loss == 1.0:
         req.stop_loss = float(strategy_row.sl)
 
-    # ── Load price data + run engine together in thread-pool ─────────────
-    # _load_price_df_sync uses fetch_ohlcv_df (UTC-aware, no asyncpg conflict)
+    # ── Load price data via targeted SQL query (no full-table scan) ──────
     try:
         df_price = await asyncio.to_thread(
             _load_price_df_sync, req.exchange, symbol, req.start_date, req.end_date
@@ -566,6 +604,7 @@ async def run_backtest(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
+    # ── Run engine (signals combiner + BackTest) in thread-pool ──────────
     try:
         df_ledger, final_balance, total_pnl_pct = await asyncio.to_thread(
             _run_engine_with_combiner, df_price, strategy_row, req
