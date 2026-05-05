@@ -279,7 +279,7 @@ def _run_engine_with_combiner(
     """
     import numpy as np
     from TradeX.backtest.backtest import BackTest
-    from TradeX.signals_combiner import run_active_signals_with_voting
+    from TradeX.strategy_generator.signals_combiner import run_active_signals_with_voting
 
     # ── a. Build flags ──────────────────────────────────────────────────────
     indicators: list[str] = list(getattr(strategy_row, "indicators", None) or [])
