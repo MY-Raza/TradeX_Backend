@@ -47,6 +47,11 @@ class StrategyListItem(StrategyBase):
     )
     pnl_sum: Optional[float] = Field(None, description="Back-test cumulative PnL")
 
+    # Most-recent backtest stats – written back by backtest_service after each run
+    last_pnl_pct: Optional[float] = Field(None, description="PnL % of the most recent backtest run")
+    last_run_tp:  Optional[float] = Field(None, description="Take-profit used in the most recent run")
+    last_run_sl:  Optional[float] = Field(None, description="Stop-loss used in the most recent run")
+
     model_config = ConfigDict(from_attributes=True)
 
 
