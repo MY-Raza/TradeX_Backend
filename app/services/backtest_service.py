@@ -226,11 +226,12 @@ def _load_price_df_sync(
         f"{limit_clause}"
     ).strip()
 
-    # Resolve sync connection string — try common env-var names
+    # Resolve sync connection string — prefer an explicit plain-psycopg2 URL,
+    # fall back to DATABASE_URL / DB_URL which may carry a SQLAlchemy dialect.
     dsn = (
-        os.environ.get("DATABASE_URL")
+        os.environ.get("SYNC_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
         or os.environ.get("DB_URL")
-        or os.environ.get("SYNC_DATABASE_URL")
     )
     if not dsn:
         raise ValueError(
@@ -238,7 +239,12 @@ def _load_price_df_sync(
             "Set DATABASE_URL, DB_URL, or SYNC_DATABASE_URL."
         )
 
-    conn = psycopg2.connect(dsn)
+    # Strip SQLAlchemy driver suffix so psycopg2 can parse the URL.
+    # e.g. postgresql+asyncpg://... → postgresql://...
+    import re
+    psycopg2_dsn = re.sub(r"^(postgresql|postgres)\+\w+://", r"\1://", dsn)
+
+    conn = psycopg2.connect(psycopg2_dsn)
     try:
         df = pd.read_sql(sql, conn, params=params if params else None)
     finally:
