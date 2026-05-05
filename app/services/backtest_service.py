@@ -1,40 +1,52 @@
 """
-TradeX – Backtest Service
+TradeX – Backtest Service  (v2)
 
-Pipeline
---------
-1. GET /backtest/strategies
-   - Read all rows from strategy_registry
-   - Extract coin symbol from each strategy name
-   - Return dropdown-ready list
+Pipeline for POST /backtest/run
+--------------------------------
+1.  Fetch strategy metadata from strategy_registry
+      → symbol, tp, sl, indicators, patterns, indicator_params
+2.  Build flags dict  { indicator/pattern: True }  for every active signal
+3.  Build windows dict from DB-stored indicator parameters
+      (slowperiod, fastperiod, timeperiod, period, fastk, slowk …)
+4.  Fetch OHLCV price data from <exchange_schema>.<symbol>_1m
+      filtered to [start_date, end_date] if supplied
+5.  Run signals_combiner.run_active_signals_with_voting()
+      → returns (df_signals, _windows_dict)
+6.  Instantiate BackTest with df_price + df_signals + tp/sl from request
+7.  Persist ledger rows to backtest_runs.<strategy_name>_run_<i>
+8.  Insert row into backtest_runs.run_registry
+9.  Update strategy_registry with last_pnl_pct / last_run_tp / last_run_sl
+10. Return BacktestResponse
 
-2. POST /backtest/run
-   a. Fetch strategy metadata (symbol, tp, sl) from strategy_registry
-   b. Resolve exchange DB schema → load price DataFrame from <schema>.<symbol>_1m
-   c. Load predictions DataFrame from strategies.<strategy_name>
-   d. Run BackTest engine in a thread-pool worker (non-blocking)
-   e. Post-process ledger → LedgerEntry, WinLossPoint, PnLPoint
-   f. Return BacktestResponse
+Additional endpoints
+---------------------
+GET  /backtest/strategies                           → dropdown list
+GET  /backtest/runs/{strategy_name}                 → list of saved runs
+GET  /backtest/runs/{strategy_name}/{run_id}/ledger → paginated ledger
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import sys
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.strategy_model import StrategyRegistry
 from app.models.backtest_model import (
     KNOWN_SYMBOLS,
+    RUN_REGISTRY_TABLE,
     extract_symbol_from_strategy,
-    get_price_table,
+    get_ledger_run_table,
     get_predictions_table,
+    get_price_table,
 )
 from app.models.data_model import EXCHANGE_SCHEMA_MAP
 from app.schemas.backtest_schema import (
@@ -43,12 +55,14 @@ from app.schemas.backtest_schema import (
     BacktestStrategyOption,
     BacktestSummary,
     LedgerEntry,
+    LedgerRunMeta,
+    PaginatedLedger,
     PnLPoint,
     WinLossPoint,
 )
 
 # ---------------------------------------------------------------------------
-# Ensure project root is on sys.path so BackTest import resolves
+# Ensure project root is on sys.path so BackTest / signals_combiner resolve
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..")
@@ -62,7 +76,6 @@ if _PROJECT_ROOT not in sys.path:
 # ===========================================================================
 
 def _streaks(wins: list[bool]) -> tuple[int, int]:
-    """Return (max_consecutive_wins, max_consecutive_losses)."""
     max_w = max_l = cur_w = cur_l = 0
     for w in wins:
         if w:
@@ -75,42 +88,104 @@ def _streaks(wins: list[bool]) -> tuple[int, int]:
 
 
 # ===========================================================================
+# Helper: build indicator windows from DB-stored strategy params
+# ===========================================================================
+
+# All parameter column names that may exist on StrategyRegistry rows
+_WINDOW_PARAM_KEYS = ("slowperiod", "fastperiod", "timeperiod", "period",
+                      "fastk", "slowk", "signalperiod")
+
+
+def _build_windows_from_db(
+    strategy_row: StrategyRegistry,
+    indicator_names: list[str],
+) -> dict:
+    """
+    Read the window/parameter columns from the strategy_registry row and map
+    them back to indicator names.
+
+    The strategy_registry is expected to carry JSONB / hstore columns like
+    ``indicator_params`` (dict[str, dict[str, int|None]]) built at strategy-
+    creation time.  If that attribute is absent we fall back to individual
+    columns (slowperiod, fastperiod, …).
+
+    Returns:  { indicator_name: { param_key: value, … }, … }
+    """
+    windows: dict = {}
+
+    # ── Preferred path: indicator_params is a JSON column ─────────────────
+    raw_params = getattr(strategy_row, "indicator_params", None)
+    if raw_params and isinstance(raw_params, dict):
+        for ind in indicator_names:
+            if ind in raw_params and raw_params[ind]:
+                filtered = {
+                    k: v for k, v in raw_params[ind].items()
+                    if v not in (None, 0)
+                }
+                if filtered:
+                    windows[ind] = filtered
+        return windows
+
+    # ── Fallback: flat scalar columns on the row ───────────────────────────
+    flat_params: dict = {}
+    for key in _WINDOW_PARAM_KEYS:
+        val = getattr(strategy_row, key, None)
+        if val is not None and val != 0:
+            flat_params[key] = val
+
+    if flat_params:
+        # Apply the same flat params to every indicator that doesn't already
+        # have a dedicated entry (best-effort when metadata is minimal).
+        for ind in indicator_names:
+            if ind not in windows:
+                windows[ind] = flat_params
+
+    return windows
+
+
+# ===========================================================================
 # 1. Strategy dropdown
 # ===========================================================================
 
 async def get_backtest_strategies(db: AsyncSession) -> list[BacktestStrategyOption]:
-    """Return all strategies from strategy_registry for the dropdown."""
     stmt = select(
         StrategyRegistry.strategy,
         StrategyRegistry.symbol,
         StrategyRegistry.timehorizon,
         StrategyRegistry.tp,
         StrategyRegistry.sl,
+        StrategyRegistry.last_pnl_pct,
+        StrategyRegistry.last_run_tp,
+        StrategyRegistry.last_run_sl,
     ).order_by(StrategyRegistry.strategy)
 
     rows = (await db.execute(stmt)).all()
     return [
         BacktestStrategyOption(
             name=row.strategy,
-            symbol=row.symbol,          # already stored in DB
+            symbol=row.symbol,
             time_horizon=row.timehorizon,
             tp=row.tp,
             sl=row.sl,
+            last_pnl_pct=float(row.last_pnl_pct) if row.last_pnl_pct is not None else None,
+            last_run_tp=float(row.last_run_tp) if row.last_run_tp is not None else None,
+            last_run_sl=float(row.last_run_sl) if row.last_run_sl is not None else None,
         )
         for row in rows
     ]
 
 
 # ===========================================================================
-# 2. Load DataFrames from DB (async, called from the router)
+# 2. Load price DataFrame (date-filtered)
 # ===========================================================================
 
 async def _load_price_df(
     db: AsyncSession,
     exchange: str,
     symbol: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
 ) -> pd.DataFrame:
-    """Read all 1-minute candles for symbol from the exchange schema."""
     schema = EXCHANGE_SCHEMA_MAP.get(exchange.lower())
     if not schema:
         raise HTTPException(
@@ -120,9 +195,25 @@ async def _load_price_df(
         )
 
     tbl = get_price_table(schema, symbol)
+    stmt = select(tbl).order_by(tbl.c.datetime.asc())
+
+    # Apply date filters when provided
+    if start_date:
+        try:
+            stmt = stmt.where(tbl.c.datetime >= pd.Timestamp(start_date))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid start_date: '{start_date}'")
+    if end_date:
+        try:
+            stmt = stmt.where(tbl.c.datetime <= pd.Timestamp(end_date))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid end_date: '{end_date}'")
+
+    # Cap at 43 200 rows (30 days × 1 440 min) when no explicit range is set
+    if not start_date and not end_date:
+        stmt = stmt.limit(43200)
+
     try:
-        # Fetch first 43200 rows (30 days of 1m candles) in chronological order
-        stmt = select(tbl).order_by(tbl.c.datetime.asc()).limit(43200)
         result = await db.execute(stmt)
         rows = result.fetchall()
     except Exception as exc:
@@ -135,8 +226,8 @@ async def _load_price_df(
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No price data found for {symbol} on {exchange}. "
-                   "Fetch data first from the Data tab.",
+            detail=f"No price data found for {symbol} on {exchange} "
+                   f"in the selected date range.",
         )
 
     df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close", "volume"])
@@ -144,50 +235,66 @@ async def _load_price_df(
     return df
 
 
-async def _load_predictions_df(
-    db: AsyncSession,
-    strategy_name: str,
-) -> pd.DataFrame:
-    """Read predictions from strategies.<strategy_name>."""
-    tbl = get_predictions_table(strategy_name)
-    try:
-        # Fetch first 43200 rows in chronological order to match price data
-        stmt = select(tbl).order_by(tbl.c.datetime.asc()).limit(43200)
-        result = await db.execute(stmt)
-        rows = result.fetchall()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Predictions table 'strategy_signals.{strategy_name}' not found. "
-                   f"Detail: {exc}",
-        )
-
-    if not rows:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No predictions found for strategy '{strategy_name}'.",
-        )
-
-    df = pd.DataFrame(rows, columns=["datetime", "signals"])
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
-    return df
-
-
 # ===========================================================================
-# 3. Run BackTest engine (synchronous – called inside asyncio.to_thread)
+# 3. Run BackTest engine (synchronous, called inside asyncio.to_thread)
 # ===========================================================================
 
-def _run_engine(
+def _run_engine_with_combiner(
     df_price: pd.DataFrame,
-    df_predictions: pd.DataFrame,
+    strategy_row: StrategyRegistry,
     req: BacktestRunRequest,
 ) -> tuple[pd.DataFrame, float, float]:
-    """Instantiate and run BackTest. Returns (df_ledger, final_balance, total_pnl_pct)."""
-    from TradeX.backtest.backtest import BackTest   # lazy import inside thread
+    """
+    a. Build flags dict (all strategy indicators + patterns → True).
+    b. Build windows dict from DB-stored indicator parameters.
+    c. Call signals_combiner.run_active_signals_with_voting().
+    d. Pass resulting signals + price data into BackTest engine.
+    Returns (df_ledger, final_balance, total_pnl_pct).
+    """
+    import numpy as np
+    from TradeX.backtest.backtest import BackTest
+    from TradeX.signals_combiner import run_active_signals_with_voting
 
+    # ── a. Build flags ──────────────────────────────────────────────────────
+    indicators: list[str] = list(getattr(strategy_row, "indicators", None) or [])
+    patterns:   list[str] = list(getattr(strategy_row, "patterns",   None) or [])
+    all_signals = indicators + patterns
+
+    if not all_signals:
+        raise ValueError(
+            f"Strategy '{strategy_row.strategy}' has no indicators or patterns configured."
+        )
+
+    flags: dict[str, bool] = {name: True for name in all_signals}
+
+    # ── b. Build windows ────────────────────────────────────────────────────
+    windows_from_db = _build_windows_from_db(strategy_row, indicators)
+
+    # ── c. Run signals combiner ─────────────────────────────────────────────
+    open_  = df_price["open"].to_numpy(dtype=np.float64)
+    high   = df_price["high"].to_numpy(dtype=np.float64)
+    low    = df_price["low"].to_numpy(dtype=np.float64)
+    close_ = df_price["close"].to_numpy(dtype=np.float64)
+    volume = df_price["volume"].to_numpy(dtype=np.float64)
+    timestamps = df_price["datetime"].values
+
+    df_signals, _returned_windows = run_active_signals_with_voting(
+        flags=flags,
+        open_=open_,
+        high=high,
+        low=low,
+        close_=close_,
+        volume=volume,
+        timestamps=timestamps,
+    )
+
+    if df_signals.empty:
+        raise ValueError("Signal combiner returned no signals for the selected date range.")
+
+    # ── d. BackTest engine ──────────────────────────────────────────────────
     bt = BackTest(
         df_price=df_price,
-        df_predictions=df_predictions,
+        df_predictions=df_signals,
         starting_balance=req.starting_balance,
         take_profit=req.take_profit,
         stop_loss=req.stop_loss,
@@ -200,7 +307,159 @@ def _run_engine(
 
 
 # ===========================================================================
-# 4. Post-process ledger → response schemas
+# 4. Next run index for a strategy
+# ===========================================================================
+
+async def _next_run_index(db: AsyncSession, strategy_name: str) -> int:
+    """Count existing runs for this strategy and return next index (1-based)."""
+    try:
+        stmt = select(func.count()).select_from(RUN_REGISTRY_TABLE).where(
+            RUN_REGISTRY_TABLE.c.strategy_name == strategy_name
+        )
+        count = (await db.execute(stmt)).scalar() or 0
+        return count + 1
+    except Exception:
+        # run_registry table may not exist yet – will be created on first insert
+        return 1
+
+
+# ===========================================================================
+# 5. Persist ledger + registry row
+# ===========================================================================
+
+async def _persist_run(
+    db: AsyncSession,
+    df_ledger: pd.DataFrame,
+    req: BacktestRunRequest,
+    strategy_name: str,
+    run_index: int,
+    final_balance: float,
+    total_pnl_pct: float,
+    total_trades: int,
+    win_rate: float,
+) -> str:
+    """
+    Create backtest_runs schema + tables if needed, insert ledger rows and a
+    run_registry record.  Returns the generated table_name.
+    """
+    table_name = f"{strategy_name}_run_{run_index}"
+
+    # Ensure schema exists
+    await db.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
+
+    # Create run_registry if absent
+    await db.execute(text("""
+        CREATE TABLE IF NOT EXISTS backtest_runs.run_registry (
+            id            SERIAL PRIMARY KEY,
+            table_name    TEXT NOT NULL UNIQUE,
+            strategy_name TEXT NOT NULL,
+            exchange      TEXT NOT NULL,
+            start_date    TEXT,
+            end_date      TEXT,
+            take_profit   DOUBLE PRECISION NOT NULL,
+            stop_loss     DOUBLE PRECISION NOT NULL,
+            total_trades  INTEGER NOT NULL,
+            win_rate      DOUBLE PRECISION NOT NULL,
+            total_pnl_pct DOUBLE PRECISION NOT NULL,
+            final_balance DOUBLE PRECISION NOT NULL,
+            created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """))
+
+    # Create the individual ledger table
+    await db.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS backtest_runs."{table_name}" (
+            id                  SERIAL PRIMARY KEY,
+            datetime            TIMESTAMP NOT NULL,
+            action              TEXT NOT NULL,
+            buy_price           DOUBLE PRECISION,
+            sell_price          DOUBLE PRECISION,
+            pnl                 DOUBLE PRECISION,
+            pnl_sum             DOUBLE PRECISION,
+            balance             DOUBLE PRECISION NOT NULL,
+            predicted_direction TEXT NOT NULL
+        )
+    """))
+
+    # Insert ledger rows in bulk
+    if not df_ledger.empty:
+        rows_to_insert = []
+        for _, row in df_ledger.iterrows():
+            rows_to_insert.append({
+                "datetime":            str(row["datetime"]),
+                "action":              str(row["action"]),
+                "buy_price":           float(row["buy_price"])  if pd.notna(row.get("buy_price"))  else None,
+                "sell_price":          float(row["sell_price"]) if pd.notna(row.get("sell_price")) else None,
+                "pnl":                 float(row["pnl"])        if pd.notna(row.get("pnl"))        else None,
+                "pnl_sum":             float(row["pnl_sum"])    if "pnl_sum" in row.index and pd.notna(row["pnl_sum"]) else None,
+                "balance":             float(row["balance"]),
+                "predicted_direction": str(row["predicted_direction"]),
+            })
+
+        if rows_to_insert:
+            ledger_tbl = get_ledger_run_table(table_name)
+            await db.execute(ledger_tbl.insert(), rows_to_insert)
+
+    # Insert run_registry row
+    await db.execute(
+        RUN_REGISTRY_TABLE.insert().values(
+            table_name=table_name,
+            strategy_name=strategy_name,
+            exchange=req.exchange,
+            start_date=req.start_date,
+            end_date=req.end_date,
+            take_profit=req.take_profit,
+            stop_loss=req.stop_loss,
+            total_trades=total_trades,
+            win_rate=win_rate,
+            total_pnl_pct=total_pnl_pct,
+            final_balance=final_balance,
+            created_at=datetime.utcnow(),
+        )
+    )
+
+    await db.commit()
+    return table_name
+
+
+# ===========================================================================
+# 6. Update strategy_registry with latest run stats
+# ===========================================================================
+
+async def _update_strategy_stats(
+    db: AsyncSession,
+    strategy_name: str,
+    total_pnl_pct: float,
+    take_profit: float,
+    stop_loss: float,
+) -> None:
+    """Persist last_pnl_pct, last_run_tp, last_run_sl back to strategy_registry."""
+    try:
+        # Ensure columns exist (idempotent)
+        for col_def in [
+            "ADD COLUMN IF NOT EXISTS last_pnl_pct  DOUBLE PRECISION",
+            "ADD COLUMN IF NOT EXISTS last_run_tp   DOUBLE PRECISION",
+            "ADD COLUMN IF NOT EXISTS last_run_sl   DOUBLE PRECISION",
+        ]:
+            await db.execute(text(f"ALTER TABLE strategy_registry {col_def}"))
+
+        await db.execute(
+            text("""
+                UPDATE strategy_registry
+                   SET last_pnl_pct = :pnl,
+                       last_run_tp  = :tp,
+                       last_run_sl  = :sl
+                 WHERE strategy = :name
+            """),
+            {"pnl": total_pnl_pct, "tp": take_profit, "sl": stop_loss, "name": strategy_name},
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()   # non-fatal – stats update is best-effort
+
+
+# ===========================================================================
+# 7. Post-process ledger → BacktestResponse
 # ===========================================================================
 
 def _build_response(
@@ -209,16 +468,15 @@ def _build_response(
     total_pnl_pct: float,
     req: BacktestRunRequest,
     symbol: str,
+    run_table_name: Optional[str] = None,
 ) -> BacktestResponse:
 
-    # ── Ledger entries ────────────────────────────────────────────────────
     ledger_entries: list[LedgerEntry] = []
     for _, row in df_ledger.iterrows():
         action: str = str(row["action"])
         is_buy = action == "buy"
         reason = None
         if not is_buy:
-            # action is like "sell - take_profit"
             parts = action.split(" - ", 1)
             reason = parts[1] if len(parts) == 2 else action
 
@@ -233,7 +491,6 @@ def _build_response(
             reason=reason,
         ))
 
-    # ── Stats from sell rows only ─────────────────────────────────────────
     sell_rows = df_ledger[df_ledger["action"].str.startswith("sell")]
     total_trades = len(sell_rows)
     win_mask = (sell_rows["pnl"] > 0).tolist()
@@ -243,19 +500,15 @@ def _build_response(
     loss_rate = round(100 - win_rate, 2)
     max_w, max_l = _streaks(win_mask)
 
-    # ── Win/loss bar chart ────────────────────────────────────────────────
     win_loss_data = [
         WinLossPoint(name="Trades Won",  value=win_trades),
         WinLossPoint(name="Trades Lost", value=loss_trades),
     ]
-
-    # ── PnL-per-trade line chart (sell rows only, numbered 1…N) ──────────
     pnl_data = [
         PnLPoint(trade=i + 1, pnl=round(float(pnl), 2))
         for i, pnl in enumerate(sell_rows["pnl"].tolist())
     ]
 
-    # ── Summary ───────────────────────────────────────────────────────────
     summary = BacktestSummary(
         strategy_name=req.strategy_name,
         exchange=req.exchange,
@@ -270,6 +523,7 @@ def _build_response(
         loss_rate=loss_rate,
         max_consecutive_wins=max_w,
         max_consecutive_losses=max_l,
+        run_table_name=run_table_name,
     )
 
     return BacktestResponse(
@@ -281,23 +535,16 @@ def _build_response(
 
 
 # ===========================================================================
-# 5. Public entry-point called by the router
+# 8. Public entry-point: run backtest
 # ===========================================================================
 
 async def run_backtest(
     db: AsyncSession,
     req: BacktestRunRequest,
 ) -> BacktestResponse:
-    """
-    Full pipeline:
-      1. Fetch strategy metadata → get symbol, tp, sl
-      2. Load price data from exchange DB schema
-      3. Load predictions from strategies schema
-      4. Run BackTest engine in thread-pool (non-blocking)
-      5. Build and return BacktestResponse
-    """
+    """Full pipeline – see module docstring."""
 
-    # ── 1. Strategy metadata ──────────────────────────────────────────────
+    # ── Strategy metadata ─────────────────────────────────────────────────
     strategy_row: Optional[StrategyRegistry] = (
         await db.execute(
             select(StrategyRegistry).where(
@@ -312,35 +559,32 @@ async def run_backtest(
             detail=f"Strategy '{req.strategy_name}' not found in strategy_registry.",
         )
 
-    # symbol is stored directly in the DB; also try name extraction as fallback
     symbol: str = (
-        strategy_row.symbol
-        or extract_symbol_from_strategy(req.strategy_name)
+        strategy_row.symbol or extract_symbol_from_strategy(req.strategy_name)
     ).lower()
 
     if not symbol:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Cannot determine coin symbol for strategy '{req.strategy_name}'. "
-                   "Ensure the strategy name contains a known coin (btc, eth, bnb…).",
+            detail=f"Cannot determine coin symbol for strategy '{req.strategy_name}'.",
         )
 
-    # Override tp/sl from DB if not supplied in request defaults
-    effective_tp = float(strategy_row.tp) if strategy_row.tp else req.take_profit
-    effective_sl = float(strategy_row.sl) if strategy_row.sl else req.stop_loss
-    req.take_profit = effective_tp
-    req.stop_loss   = effective_sl
+    # Use DB defaults for tp/sl only when request carries the model defaults (1.0/1.0)
+    # and the DB has explicit values stored.
+    if strategy_row.tp and req.take_profit == 1.0:
+        req.take_profit = float(strategy_row.tp)
+    if strategy_row.sl and req.stop_loss == 1.0:
+        req.stop_loss = float(strategy_row.sl)
 
-    # ── 2 & 3. Load DataFrames ────────────────────────────────────────────
-    df_price, df_predictions = await asyncio.gather(
-        _load_price_df(db, req.exchange, symbol),
-        _load_predictions_df(db, req.strategy_name),
+    # ── Load price data ───────────────────────────────────────────────────
+    df_price = await _load_price_df(
+        db, req.exchange, symbol, req.start_date, req.end_date
     )
 
-    # ── 4. Run engine in thread-pool ──────────────────────────────────────
+    # ── Run engine (signals combiner + BackTest) in thread-pool ──────────
     try:
         df_ledger, final_balance, total_pnl_pct = await asyncio.to_thread(
-            _run_engine, df_price, df_predictions, req
+            _run_engine_with_combiner, df_price, strategy_row, req
         )
     except Exception as exc:
         raise HTTPException(
@@ -351,9 +595,154 @@ async def run_backtest(
     if df_ledger.empty:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Backtest completed but produced no trades. "
-                   "Check that predictions contain non-zero signals.",
+            detail="Backtest completed but produced no trades.",
         )
 
-    # ── 5. Build response ─────────────────────────────────────────────────
-    return _build_response(df_ledger, final_balance, total_pnl_pct, req, symbol)
+    # Compute summary stats needed for saving
+    sell_rows = df_ledger[df_ledger["action"].str.startswith("sell")]
+    total_trades = len(sell_rows)
+    win_trades = int((sell_rows["pnl"] > 0).sum())
+    win_rate = round(win_trades / total_trades * 100, 2) if total_trades else 0.0
+
+    # ── Persist ledger & update stats ────────────────────────────────────
+    run_index = await _next_run_index(db, req.strategy_name)
+
+    run_table_name = await _persist_run(
+        db=db,
+        df_ledger=df_ledger,
+        req=req,
+        strategy_name=req.strategy_name,
+        run_index=run_index,
+        final_balance=final_balance,
+        total_pnl_pct=total_pnl_pct,
+        total_trades=total_trades,
+        win_rate=win_rate,
+    )
+
+    await _update_strategy_stats(
+        db=db,
+        strategy_name=req.strategy_name,
+        total_pnl_pct=total_pnl_pct,
+        take_profit=req.take_profit,
+        stop_loss=req.stop_loss,
+    )
+
+    return _build_response(df_ledger, final_balance, total_pnl_pct, req, symbol, run_table_name)
+
+
+# ===========================================================================
+# 9. List saved runs for a strategy
+# ===========================================================================
+
+async def get_strategy_runs(
+    db: AsyncSession,
+    strategy_name: str,
+) -> list[LedgerRunMeta]:
+    try:
+        stmt = (
+            select(RUN_REGISTRY_TABLE)
+            .where(RUN_REGISTRY_TABLE.c.strategy_name == strategy_name)
+            .order_by(RUN_REGISTRY_TABLE.c.id.desc())
+        )
+        rows = (await db.execute(stmt)).fetchall()
+    except Exception:
+        return []
+
+    return [
+        LedgerRunMeta(
+            run_id=row.id,
+            table_name=row.table_name,
+            strategy_name=row.strategy_name,
+            exchange=row.exchange,
+            start_date=row.start_date,
+            end_date=row.end_date,
+            take_profit=row.take_profit,
+            stop_loss=row.stop_loss,
+            total_trades=row.total_trades,
+            win_rate=row.win_rate,
+            total_pnl_pct=row.total_pnl_pct,
+            final_balance=row.final_balance,
+            created_at=str(row.created_at),
+        )
+        for row in rows
+    ]
+
+
+# ===========================================================================
+# 10. Paginated ledger for a specific run
+# ===========================================================================
+
+async def get_run_ledger(
+    db: AsyncSession,
+    strategy_name: str,
+    run_id: int,
+    page: int = 1,
+    page_size: int = 50,
+) -> PaginatedLedger:
+    # Fetch run meta
+    stmt = select(RUN_REGISTRY_TABLE).where(
+        RUN_REGISTRY_TABLE.c.id == run_id,
+        RUN_REGISTRY_TABLE.c.strategy_name == strategy_name,
+    )
+    row = (await db.execute(stmt)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found for strategy '{strategy_name}'.")
+
+    run_meta = LedgerRunMeta(
+        run_id=row.id,
+        table_name=row.table_name,
+        strategy_name=row.strategy_name,
+        exchange=row.exchange,
+        start_date=row.start_date,
+        end_date=row.end_date,
+        take_profit=row.take_profit,
+        stop_loss=row.stop_loss,
+        total_trades=row.total_trades,
+        win_rate=row.win_rate,
+        total_pnl_pct=row.total_pnl_pct,
+        final_balance=row.final_balance,
+        created_at=str(row.created_at),
+    )
+
+    # Count total
+    count_stmt = text(
+        f'SELECT COUNT(*) FROM backtest_runs."{row.table_name}"'
+    )
+    total = (await db.execute(count_stmt)).scalar() or 0
+
+    # Fetch page
+    offset = (page - 1) * page_size
+    page_stmt = text(
+        f'SELECT * FROM backtest_runs."{row.table_name}" '
+        f'ORDER BY datetime ASC LIMIT :lim OFFSET :off'
+    )
+    ledger_rows = (await db.execute(page_stmt, {"lim": page_size, "off": offset})).fetchall()
+
+    entries: list[LedgerEntry] = []
+    for r in ledger_rows:
+        action = str(r.action)
+        is_buy = action == "buy"
+        reason = None
+        if not is_buy:
+            parts = action.split(" - ", 1)
+            reason = parts[1] if len(parts) == 2 else action
+
+        entries.append(LedgerEntry(
+            date=str(r.datetime),
+            type="Buy" if is_buy else "Sell",
+            price=float(r.buy_price if is_buy else r.sell_price) if (r.buy_price or r.sell_price) else 0.0,
+            pnl=float(r.pnl) if r.pnl is not None else None,
+            pnl_sum=float(r.pnl_sum) if r.pnl_sum is not None else None,
+            balance=float(r.balance),
+            direction=str(r.predicted_direction),
+            reason=reason,
+        ))
+
+    return PaginatedLedger(
+        run_meta=run_meta,
+        entries=entries,
+        page=page,
+        page_size=page_size,
+        total=total,
+        pages=max(1, math.ceil(total / page_size)),
+    )

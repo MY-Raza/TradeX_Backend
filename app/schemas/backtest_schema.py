@@ -5,6 +5,8 @@ Endpoints served
 ----------------
 GET  /backtest/strategies          → list[BacktestStrategyOption]   (dropdown)
 POST /backtest/run                 → BacktestResponse               (run engine)
+GET  /backtest/runs/{strategy}     → list[LedgerRunMeta]            (saved runs list)
+GET  /backtest/runs/{strategy}/{run_id}/ledger → PaginatedLedger    (paginated ledger)
 """
 
 from __future__ import annotations
@@ -23,6 +25,10 @@ class BacktestStrategyOption(BaseModel):
     time_horizon: str           = Field(..., description="Candle timeframe: 1h | 15m | 5m")
     tp:           Optional[str] = None
     sl:           Optional[str] = None
+    # Most-recent run stats (populated from strategy_registry after a run)
+    last_pnl_pct: Optional[float] = None
+    last_run_tp:  Optional[float] = None
+    last_run_sl:  Optional[float] = None
 
 
 # ===========================================================================
@@ -30,15 +36,18 @@ class BacktestStrategyOption(BaseModel):
 # ===========================================================================
 
 class BacktestRunRequest(BaseModel):
-    strategy_name:     str   = Field(..., description="Strategy primary key from strategy_registry")
-    exchange:          str   = Field(..., description="Exchange id: binance | bybit | kraken | metatrader5")
-    starting_balance:  float = Field(default=1000.0, gt=0)
-    take_profit:       float = Field(default=1.0,    gt=0,  description="TP as a percentage, e.g. 1 = 1%")
-    stop_loss:         float = Field(default=1.0,    gt=0,  description="SL as a percentage, e.g. 1 = 1%")
-    buy_after_minutes: int   = Field(default=0,      ge=0)
-    fee:               float = Field(default=0.05,   ge=0)
-    leverage:          float = Field(default=1.0,    gt=0)
-    slippage:          float = Field(default=0.0,    ge=0)
+    strategy_name:     str            = Field(..., description="Strategy primary key from strategy_registry")
+    exchange:          str            = Field(..., description="Exchange id: binance | bybit | kraken | metatrader5")
+    # Date range – ISO strings like "2024-01-01" or "2024-01-01T00:00:00"
+    start_date:        Optional[str]  = Field(None, description="Start datetime (inclusive). Fetches all data if omitted.")
+    end_date:          Optional[str]  = Field(None, description="End datetime (inclusive). Fetches all data if omitted.")
+    starting_balance:  float          = Field(default=1000.0, gt=0)
+    take_profit:       float          = Field(default=1.0,    gt=0,  description="TP as a percentage, e.g. 1 = 1%")
+    stop_loss:         float          = Field(default=1.0,    gt=0,  description="SL as a percentage, e.g. 1 = 1%")
+    buy_after_minutes: int            = Field(default=0,      ge=0)
+    fee:               float          = Field(default=0.05,   ge=0)
+    leverage:          float          = Field(default=1.0,    gt=0)
+    slippage:          float          = Field(default=0.0,    ge=0)
 
 
 # ===========================================================================
@@ -87,6 +96,7 @@ class BacktestSummary(BaseModel):
     loss_rate:              float
     max_consecutive_wins:   int
     max_consecutive_losses: int
+    run_table_name:         Optional[str] = None   # e.g. "sig_1h_btc_1_run_3"
 
 
 # ===========================================================================
@@ -98,3 +108,36 @@ class BacktestResponse(BaseModel):
     ledger:        list[LedgerEntry]
     win_loss_data: list[WinLossPoint]
     pnl_data:      list[PnLPoint]
+
+
+# ===========================================================================
+# Saved-run metadata  (GET /backtest/runs/{strategy})
+# ===========================================================================
+
+class LedgerRunMeta(BaseModel):
+    run_id:        int
+    table_name:    str
+    strategy_name: str
+    exchange:      str
+    start_date:    Optional[str] = None
+    end_date:      Optional[str] = None
+    take_profit:   float
+    stop_loss:     float
+    total_trades:  int
+    win_rate:      float
+    total_pnl_pct: float
+    final_balance: float
+    created_at:    str
+
+
+# ===========================================================================
+# Paginated ledger  (GET /backtest/runs/{strategy}/{run_id}/ledger)
+# ===========================================================================
+
+class PaginatedLedger(BaseModel):
+    run_meta:  LedgerRunMeta
+    entries:   list[LedgerEntry]
+    page:      int
+    page_size: int
+    total:     int
+    pages:     int
