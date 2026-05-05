@@ -271,9 +271,18 @@ class StrategyRegistry(Base):
     macd_slowperiod:      Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     macd_signalperiod:    Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
 
+    # =========================================================================
+    # GROUP 6 – Most-recent backtest run stats
+    # Written back by backtest_service after each completed run.
+    # The service uses raw SQL "ADD COLUMN IF NOT EXISTS" so these are nullable.
+    # =========================================================================
+    last_pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    last_run_tp:  Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    last_run_sl:  Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+
     # ── Repr ───────────────────────────────────────────────────────────────
     def __repr__(self) -> str:
         return (
-            f"<StrategyRegistry id={self.id} strategy={self.strategy!r} "
+            f"<StrategyRegistry strategy={self.strategy!r} "
             f"symbol={self.symbol!r} timehorizon={self.timehorizon!r}>"
         )

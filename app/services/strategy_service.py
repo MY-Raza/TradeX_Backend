@@ -190,6 +190,9 @@ def _to_list_item(row: StrategyRegistry) -> StrategyListItem:
         indicators=_active_indicators(row),
         patterns=_active_patterns(row),
         pnl_sum=row.pnl_sum,
+        last_pnl_pct=getattr(row, "last_pnl_pct", None),
+        last_run_tp=getattr(row, "last_run_tp", None),
+        last_run_sl=getattr(row, "last_run_sl", None),
     )
 
 
@@ -206,6 +209,9 @@ def _to_detail(row: StrategyRegistry) -> StrategyDetail:
         tp=row.tp,
         sl=row.sl,
         indicator_details=_build_indicator_details(row, active),
+        last_pnl_pct=getattr(row, "last_pnl_pct", None),
+        last_run_tp=getattr(row, "last_run_tp", None),
+        last_run_sl=getattr(row, "last_run_sl", None),
     )
 
 
