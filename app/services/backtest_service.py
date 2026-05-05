@@ -86,12 +86,84 @@ def _streaks(wins: list[bool]) -> tuple[int, int]:
 
 
 # ===========================================================================
+# Helper: discover active indicators/patterns from boolean columns
+# ===========================================================================
+
+# Candlestick pattern prefix – columns starting with this are patterns
+_CDL_PREFIX = "cdl"
+
+# Columns that are NOT indicator booleans (meta / numeric / period columns)
+_NON_SIGNAL_COLS: set[str] = {
+    "strategy", "symbol", "timehorizon", "tp", "sl", "pnl_sum",
+    "last_pnl_pct", "last_run_tp", "last_run_sl",
+}
+
+
+def _extract_signals_from_row(
+    strategy_row: StrategyRegistry,
+) -> tuple[list[str], list[str]]:
+    """
+    Scan every attribute on *strategy_row* for boolean columns that are True.
+
+    Returns:
+        indicators – uppercase names of active non-CDL indicators
+        patterns   – uppercase names of active CDL patterns
+    """
+    indicators: list[str] = []
+    patterns:   list[str] = []
+
+    for col, val in vars(strategy_row).items():
+        # Skip SQLAlchemy internal state and non-signal columns
+        if col.startswith("_") or col in _NON_SIGNAL_COLS:
+            continue
+        # Skip period / param columns (contain underscore-separated suffix)
+        if any(col.endswith(sfx) for sfx in (
+            "_period", "_fastperiod", "_slowperiod", "_signalperiod",
+            "_fastk_period", "_slowk_period", "_slowd_period",
+        )):
+            continue
+        # Must be a True boolean to be active
+        if val is not True and val is not 1:
+            continue
+
+        col_lower = col.lower()
+        if col_lower.startswith(_CDL_PREFIX):
+            patterns.append(col.upper())
+        else:
+            indicators.append(col.upper())
+
+    return indicators, patterns
+
+
+# ===========================================================================
 # Helper: build indicator windows from DB-stored strategy params
 # ===========================================================================
 
-# All parameter column names that may exist on StrategyRegistry rows
-_WINDOW_PARAM_KEYS = ("slowperiod", "fastperiod", "timeperiod", "period",
-                      "fastk", "slowk", "signalperiod")
+# Mapping: indicator_name (upper) → list of (db_column_attr, param_key) pairs
+# The db_column_attr is the attribute name on StrategyRegistry (lower-case).
+# We try each column and include it if non-None and non-zero.
+_INDICATOR_PERIOD_MAP: dict[str, list[tuple[str, str]]] = {
+    # Multi-period indicators
+    "MACD":    [("macd_fastperiod", "fastperiod"), ("macd_slowperiod", "slowperiod"), ("macd_signalperiod", "signalperiod")],
+    "MACDEXT": [("macdext_fastperiod", "fastperiod"), ("macdext_slowperiod", "slowperiod"), ("macdext_signalperiod", "signalperiod")],
+    "PPO":     [("ppo_fastperiod", "fastperiod"), ("ppo_slowperiod", "slowperiod")],
+    "STOCHF":  [("stochf_fastperiod", "fastperiod"), ("stochf_slowperiod", "slowperiod")],
+    "ADOSC":   [("adosc_fastperiod", "fastperiod"), ("adosc_slowperiod", "slowperiod")],
+    "STOCH":   [("stoch_fastk_period", "fastk_period"), ("stoch_slowk_period", "slowk_period"), ("stoch_slowd_period", "slowd_period")],
+    "STOCHRSI":[("stochrsi_period", "timeperiod")],
+}
+
+# Single-period indicators: column = f"{indicator_lower}_period"
+_SINGLE_PERIOD_INDICATORS: set[str] = {
+    "EMA", "DEMA", "TEMA", "TRIMA", "WMA", "KAMA", "SMA", "BBANDS",
+    "MIDPOINT", "MIDPRICE", "MA", "T3",
+    "ADX", "ADXR", "APO", "AROON", "AROONOSC", "CCI", "CMO", "DX",
+    "MFI", "MINUS_DI", "MINUS_DM", "MOM", "PLUS_DI", "PLUS_DM",
+    "ROC", "ROCP", "ROCR", "ROCR100", "RSI", "TRIX", "WILLR",
+    "ATR", "NATR",
+    "LINEARREG", "LINEARREG_ANGLE", "LINEARREG_INTERCEPT", "LINEARREG_SLOPE",
+    "STDDEV", "TSF", "VAR",
+}
 
 
 def _build_windows_from_db(
@@ -100,43 +172,44 @@ def _build_windows_from_db(
 ) -> dict:
     """
     Read the window/parameter columns from the strategy_registry row and map
-    them back to indicator names.
+    them to each active indicator.
 
-    The strategy_registry is expected to carry JSONB / hstore columns like
-    ``indicator_params`` (dict[str, dict[str, int|None]]) built at strategy-
-    creation time.  If that attribute is absent we fall back to individual
-    columns (slowperiod, fastperiod, …).
+    Tries per-indicator dedicated period columns first (e.g. ``ema_period``,
+    ``macd_fastperiod`` …).  CDL patterns never need period params.
 
-    Returns:  { indicator_name: { param_key: value, … }, … }
+    Returns:  { INDICATOR_NAME_UPPER: { param_key: value, … }, … }
     """
     windows: dict = {}
 
-    # ── Preferred path: indicator_params is a JSON column ─────────────────
-    raw_params = getattr(strategy_row, "indicator_params", None)
-    if raw_params and isinstance(raw_params, dict):
-        for ind in indicator_names:
-            if ind in raw_params and raw_params[ind]:
-                filtered = {
-                    k: v for k, v in raw_params[ind].items()
-                    if v not in (None, 0)
-                }
-                if filtered:
-                    windows[ind] = filtered
-        return windows
+    for ind in indicator_names:
+        ind_upper = ind.upper()
+        params: dict = {}
 
-    # ── Fallback: flat scalar columns on the row ───────────────────────────
-    flat_params: dict = {}
-    for key in _WINDOW_PARAM_KEYS:
-        val = getattr(strategy_row, key, None)
-        if val is not None and val != 0:
-            flat_params[key] = val
+        # ── Multi-period indicators ────────────────────────────────────────
+        if ind_upper in _INDICATOR_PERIOD_MAP:
+            for attr, param_key in _INDICATOR_PERIOD_MAP[ind_upper]:
+                val = getattr(strategy_row, attr, None)
+                if val is not None and val != 0:
+                    try:
+                        params[param_key] = int(val)
+                    except (TypeError, ValueError):
+                        pass
 
-    if flat_params:
-        # Apply the same flat params to every indicator that doesn't already
-        # have a dedicated entry (best-effort when metadata is minimal).
-        for ind in indicator_names:
-            if ind not in windows:
-                windows[ind] = flat_params
+        # ── Single-period indicators ───────────────────────────────────────
+        elif ind_upper in _SINGLE_PERIOD_INDICATORS:
+            attr = f"{ind.lower()}_period"
+            val = getattr(strategy_row, attr, None)
+            if val is not None and val != 0:
+                try:
+                    params["timeperiod"] = int(val)
+                except (TypeError, ValueError):
+                    pass
+
+        # ── CDL patterns: no period params needed ─────────────────────────
+        # (skip silently)
+
+        if params:
+            windows[ind_upper] = params
 
     return windows
 
@@ -282,8 +355,10 @@ def _run_engine_with_combiner(
     from TradeX.strategy_generator.signals_combiner import run_active_signals_with_voting
 
     # ── a. Build flags ──────────────────────────────────────────────────────
-    indicators: list[str] = list(getattr(strategy_row, "indicators", None) or [])
-    patterns:   list[str] = list(getattr(strategy_row, "patterns",   None) or [])
+    # Scan boolean columns on the DB row – names are UPPERCASED so that
+    # signals_combiner and TA-Lib receive the canonical form (e.g. "RSI",
+    # "CDLHAMMER") regardless of how they are stored in the registry.
+    indicators, patterns = _extract_signals_from_row(strategy_row)
     all_signals = indicators + patterns
 
     if not all_signals:
@@ -293,8 +368,9 @@ def _run_engine_with_combiner(
 
     flags: dict[str, bool] = {name: True for name in all_signals}
 
-    # ── b. Build windows ────────────────────────────────────────────────────
-    windows_from_db = _build_windows_from_db(strategy_row, indicators)
+    # ── b. Build windows (uppercase keys, per-indicator period columns) ─────
+    # Only non-CDL indicators carry period params; patterns are passed as-is.
+    windows_from_db = _build_windows_from_db(strategy_row, all_signals)
 
     # ── c. Run signals combiner ─────────────────────────────────────────────
     open_  = df_price["open"].to_numpy(dtype=np.float64)
@@ -312,6 +388,7 @@ def _run_engine_with_combiner(
         close_=close_,
         volume=volume,
         timestamps=timestamps,
+        windows_override=windows_from_db,
     )
 
     if df_signals.empty:
