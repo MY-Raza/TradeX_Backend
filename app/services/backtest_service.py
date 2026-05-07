@@ -548,8 +548,19 @@ async def _persist_run(
     if not df_ledger.empty:
         rows_to_insert = []
         for _, row in df_ledger.iterrows():
+            # asyncpg requires a real datetime object for TIMESTAMP columns —
+            # passing str() raises "expected datetime.datetime, got str".
+            # pd.Timestamp is a datetime subclass so it works directly;
+            # we convert via .to_pydatetime() to strip any tz info and give
+            # asyncpg a plain tz-naive datetime.datetime instance.
+            dt_val = row["datetime"]
+            if isinstance(dt_val, pd.Timestamp):
+                dt_val = dt_val.to_pydatetime().replace(tzinfo=None)
+            else:
+                dt_val = pd.Timestamp(dt_val).to_pydatetime().replace(tzinfo=None)
+
             rows_to_insert.append({
-                "datetime":            str(row["datetime"]),
+                "datetime":            dt_val,
                 "action":              str(row["action"]),
                 "buy_price":           float(row["buy_price"])  if pd.notna(row.get("buy_price"))  else None,
                 "sell_price":          float(row["sell_price"]) if pd.notna(row.get("sell_price")) else None,
