@@ -371,24 +371,46 @@ def _load_price_df_sync(
 # 3. Run BackTest engine (synchronous, called inside asyncio.to_thread)
 # ===========================================================================
 
+def _extract_timeframe_from_strategy(strategy_name: str) -> str:
+    """
+    Extract the candle timeframe from a strategy name.
+
+    Naming convention: sig_<timeframe>_<symbol>_<id>
+    Examples:
+        sig_1h_btc_1    -> "1h"
+        sig_15m_eth_22  -> "15m"
+        sig_5m_bnb_3    -> "5m"
+
+    Supported suffixes: m (minutes), h (hours), d (days).
+    Falls back to "1h" if no recognisable token is found.
+    """
+    import re
+    match = re.search(r"\b(\d+[mhd])\b", strategy_name.lower())
+    if match:
+        return match.group(1)
+    return "1h"   # safe fallback
+
+
 def _run_engine_with_combiner(
     df_price: pd.DataFrame,
     strategy_row: StrategyRegistry,
     req: BacktestRunRequest,
 ) -> tuple[pd.DataFrame, float, float]:
     """
-    a. Build flags dict (all strategy indicators + patterns → True).
+    a. Build flags dict (all strategy indicators + patterns -> True).
     b. Build windows dict from DB-stored indicator parameters.
-    c. Call signals_combiner.run_active_signals_with_voting().
-    d. Pass resulting signals + price data into BackTest engine.
+    c. Resample 1-min OHLCV to the strategy's native timeframe.
+    d. Call signals_combiner.run_active_signals_with_voting().
+    e. Pass resulting signals + resampled price data into BackTest engine.
     Returns (df_ledger, final_balance, total_pnl_pct).
     """
     import numpy as np
     from TradeX.backtest.backtest import BackTest
     from TradeX.strategy_generator.signals_combiner import run_active_signals_with_voting
+    from TradeX.utils.data.data_cleaner import resample_ohlcv
 
-    # ── a. Build flags ──────────────────────────────────────────────────────
-    # Scan boolean columns on the DB row – names are UPPERCASED so that
+    # -- a. Build flags -------------------------------------------------------
+    # Scan boolean columns on the DB row - names are UPPERCASED so that
     # signals_combiner and TA-Lib receive the canonical form (e.g. "RSI",
     # "CDLHAMMER") regardless of how they are stored in the registry.
     indicators, patterns = _extract_signals_from_row(strategy_row)
@@ -401,17 +423,31 @@ def _run_engine_with_combiner(
 
     flags: dict[str, bool] = {name: True for name in all_signals}
 
-    # ── b. Build windows (uppercase keys, per-indicator period columns) ─────
+    # -- b. Build windows (uppercase keys, per-indicator period columns) ------
     # Only non-CDL indicators carry period params; patterns are passed as-is.
     windows_from_db = _build_windows_from_db(strategy_row, all_signals)
 
-    # ── c. Run signals combiner ─────────────────────────────────────────────
-    open_  = df_price["open"].to_numpy(dtype=np.float64)
-    high   = df_price["high"].to_numpy(dtype=np.float64)
-    low    = df_price["low"].to_numpy(dtype=np.float64)
-    close_ = df_price["close"].to_numpy(dtype=np.float64)
-    volume = df_price["volume"].to_numpy(dtype=np.float64)
-    timestamps = df_price["datetime"].values
+    # -- c. Resample 1-min price data to strategy timeframe ------------------
+    # The DB always stores 1-minute candles. Signals must be computed on the
+    # timeframe encoded in the strategy name (e.g. "1h", "15m", "5m") so that
+    # indicator periods match what the strategy was trained on.
+    timeframe = _extract_timeframe_from_strategy(strategy_row.strategy)
+    df_price_resampled = resample_ohlcv(df_price, timeframe)
+
+    if df_price_resampled.empty:
+        raise ValueError(
+            f"Resampling 1m data to '{timeframe}' produced an empty DataFrame "
+            f"for strategy '{strategy_row.strategy}'. "
+            "Ensure enough historical data is available for the selected date range."
+        )
+
+    # -- d. Run signals combiner ---------------------------------------------
+    open_  = df_price_resampled["open"].to_numpy(dtype=np.float64)
+    high   = df_price_resampled["high"].to_numpy(dtype=np.float64)
+    low    = df_price_resampled["low"].to_numpy(dtype=np.float64)
+    close_ = df_price_resampled["close"].to_numpy(dtype=np.float64)
+    volume = df_price_resampled["volume"].to_numpy(dtype=np.float64)
+    timestamps = df_price_resampled["datetime"].values
 
     df_signals, _returned_windows = run_active_signals_with_voting(
         flags=flags,
@@ -427,9 +463,9 @@ def _run_engine_with_combiner(
     if df_signals.empty:
         raise ValueError("Signal combiner returned no signals for the selected date range.")
 
-    # ── d. BackTest engine ──────────────────────────────────────────────────
+    # -- e. BackTest engine --------------------------------------------------
     bt = BackTest(
-        df_price=df_price,
+        df_price=df_price_resampled,
         df_predictions=df_signals,
         starting_balance=req.starting_balance,
         take_profit=req.take_profit,
@@ -440,7 +476,6 @@ def _run_engine_with_combiner(
         slippage=req.slippage,
     )
     return bt.run()
-
 
 # ===========================================================================
 # 4. Next run index for a strategy
