@@ -1,6 +1,5 @@
 """
 TradeX – Backtest Service  (v2)
-
 Pipeline for POST /backtest/run
 --------------------------------
 1.  Fetch strategy metadata from strategy_registry
