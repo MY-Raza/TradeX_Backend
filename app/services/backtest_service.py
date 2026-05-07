@@ -422,7 +422,11 @@ async def _next_run_index(db: AsyncSession, strategy_name: str) -> int:
         count = (await db.execute(stmt)).scalar() or 0
         return count + 1
     except Exception:
-        # run_registry table may not exist yet – will be created on first insert
+        # run_registry table may not exist yet – will be created on first insert.
+        # CRITICAL: must rollback here so the session is NOT left in an aborted
+        # state. Without this, every subsequent statement in _persist_run raises
+        # "InFailedSQLTransactionError: current transaction is aborted".
+        await db.rollback()
         return 1
 
 
@@ -447,14 +451,24 @@ async def _persist_run(
     """
     table_name = f"{strategy_name}_run_{run_index}"
 
-    # ── DDL phase: create schema + tables and commit immediately ────────────
-    # These CREATE IF NOT EXISTS statements must run in their own committed
-    # transaction so that a later DML failure cannot roll them back and leave
-    # the session in an aborted state for the next request.
+    # ── DDL phase: create schema + tables via raw asyncpg (auto-commit) ─────
+    # CRITICAL: DDL must NOT run through the SQLAlchemy async session.
+    # When _next_run_index fails (table not yet created), it leaves the
+    # session in an aborted transaction.  Any db.execute() here would
+    # immediately raise InFailedSQLTransactionError.
+    #
+    # Solution: grab the underlying asyncpg driver connection and execute DDL
+    # directly.  asyncpg runs each statement in its own implicit transaction
+    # (auto-commit semantics) when not inside an explicit BEGIN block, so
+    # CREATE IF NOT EXISTS commits instantly and is never rolled back.
     try:
-        await db.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
+        raw_conn = await db.connection()
+        raw_asyncpg = await raw_conn.get_raw_connection()
+        asyncpg_conn = raw_asyncpg.driver_connection
 
-        await db.execute(text("""
+        await asyncpg_conn.execute("CREATE SCHEMA IF NOT EXISTS backtest_runs")
+
+        await asyncpg_conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_runs.run_registry (
                 id            SERIAL PRIMARY KEY,
                 table_name    TEXT NOT NULL UNIQUE,
@@ -470,9 +484,9 @@ async def _persist_run(
                 final_balance DOUBLE PRECISION NOT NULL,
                 created_at    TIMESTAMP NOT NULL DEFAULT NOW()
             )
-        """))
+        """)
 
-        await db.execute(text(f"""
+        await asyncpg_conn.execute(f"""
             CREATE TABLE IF NOT EXISTS backtest_runs."{table_name}" (
                 id                  SERIAL PRIMARY KEY,
                 datetime            TIMESTAMP NOT NULL,
@@ -484,10 +498,11 @@ async def _persist_run(
                 balance             DOUBLE PRECISION NOT NULL,
                 predicted_direction TEXT NOT NULL
             )
-        """))
-
-        # Commit DDL immediately so it is never rolled back by a later error
-        await db.commit()
+        """)
+        # Each asyncpg.execute() above auto-commits (no explicit BEGIN).
+        # Now reset the SQLAlchemy session so it starts a fresh transaction
+        # for the DML inserts below.
+        await db.rollback()
     except Exception:
         await db.rollback()
         raise
