@@ -422,11 +422,7 @@ async def _next_run_index(db: AsyncSession, strategy_name: str) -> int:
         count = (await db.execute(stmt)).scalar() or 0
         return count + 1
     except Exception:
-        # run_registry table may not exist yet – will be created on first insert.
-        # CRITICAL: must rollback here so the session is NOT left in an aborted
-        # state. Without this, every subsequent statement in _persist_run raises
-        # "InFailedSQLTransactionError: current transaction is aborted".
-        await db.rollback()
+        # run_registry table may not exist yet – will be created on first insert
         return 1
 
 
@@ -451,51 +447,47 @@ async def _persist_run(
     """
     table_name = f"{strategy_name}_run_{run_index}"
 
-    # ── DDL phase: create schema + tables with AUTOCOMMIT isolation ──────────
-    # CRITICAL: DDL must be executed with autocommit=True so each CREATE
-    # statement commits immediately and can never be rolled back by a later
-    # DML failure.  We also cannot use the existing `db` session here because
-    # _next_run_index may have left it in an aborted transaction state (if
-    # run_registry didn't exist yet).  We open a brand-new engine connection
-    # with execution_options(isolation_level="AUTOCOMMIT") instead.
+    # ── DDL phase: create schema + tables and commit immediately ────────────
+    # These CREATE IF NOT EXISTS statements must run in their own committed
+    # transaction so that a later DML failure cannot roll them back and leave
+    # the session in an aborted state for the next request.
     try:
-        engine = db.get_bind()
-        async with engine.connect() as ddl_conn:
-            await ddl_conn.execution_options(isolation_level="AUTOCOMMIT")
-            await ddl_conn.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
-            await ddl_conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS backtest_runs.run_registry (
-                    id            SERIAL PRIMARY KEY,
-                    table_name    TEXT NOT NULL UNIQUE,
-                    strategy_name TEXT NOT NULL,
-                    exchange      TEXT NOT NULL,
-                    start_date    TEXT,
-                    end_date      TEXT,
-                    take_profit   DOUBLE PRECISION NOT NULL,
-                    stop_loss     DOUBLE PRECISION NOT NULL,
-                    total_trades  INTEGER NOT NULL,
-                    win_rate      DOUBLE PRECISION NOT NULL,
-                    total_pnl_pct DOUBLE PRECISION NOT NULL,
-                    final_balance DOUBLE PRECISION NOT NULL,
-                    created_at    TIMESTAMP NOT NULL DEFAULT NOW()
-                )
-            """))
-            await ddl_conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS backtest_runs."{table_name}" (
-                    id                  SERIAL PRIMARY KEY,
-                    datetime            TIMESTAMP NOT NULL,
-                    action              TEXT NOT NULL,
-                    buy_price           DOUBLE PRECISION,
-                    sell_price          DOUBLE PRECISION,
-                    pnl                 DOUBLE PRECISION,
-                    pnl_sum             DOUBLE PRECISION,
-                    balance             DOUBLE PRECISION NOT NULL,
-                    predicted_direction TEXT NOT NULL
-                )
-            """))
-        # DDL connection is now closed and all statements are committed.
-        # Ensure the main session is clean for DML below.
-        await db.rollback()
+        await db.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
+
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS backtest_runs.run_registry (
+                id            SERIAL PRIMARY KEY,
+                table_name    TEXT NOT NULL UNIQUE,
+                strategy_name TEXT NOT NULL,
+                exchange      TEXT NOT NULL,
+                start_date    TEXT,
+                end_date      TEXT,
+                take_profit   DOUBLE PRECISION NOT NULL,
+                stop_loss     DOUBLE PRECISION NOT NULL,
+                total_trades  INTEGER NOT NULL,
+                win_rate      DOUBLE PRECISION NOT NULL,
+                total_pnl_pct DOUBLE PRECISION NOT NULL,
+                final_balance DOUBLE PRECISION NOT NULL,
+                created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+
+        await db.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS backtest_runs."{table_name}" (
+                id                  SERIAL PRIMARY KEY,
+                datetime            TIMESTAMP NOT NULL,
+                action              TEXT NOT NULL,
+                buy_price           DOUBLE PRECISION,
+                sell_price          DOUBLE PRECISION,
+                pnl                 DOUBLE PRECISION,
+                pnl_sum             DOUBLE PRECISION,
+                balance             DOUBLE PRECISION NOT NULL,
+                predicted_direction TEXT NOT NULL
+            )
+        """))
+
+        # Commit DDL immediately so it is never rolled back by a later error
+        await db.commit()
     except Exception:
         await db.rollback()
         raise
