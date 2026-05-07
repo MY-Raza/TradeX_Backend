@@ -1,5 +1,5 @@
 """
-TradeX – Backtest Service  (v3)
+TradeX – Backtest Service  (v4)
 Pipeline for POST /backtest/run
 --------------------------------
 1.  Fetch strategy metadata from strategy_registry
@@ -23,7 +23,7 @@ GET  /backtest/strategies                           → dropdown list
 GET  /backtest/runs/{strategy_name}                 → list of saved runs
 GET  /backtest/runs/{strategy_name}/{run_id}/ledger → paginated ledger
 
-FIX LOG (v3)
+FIX LOG (v4)
 -------------
 - _next_run_index: added `await db.rollback()` in except block so a missing
   run_registry table on first run no longer leaves the session in an aborted
@@ -36,6 +36,13 @@ FIX LOG (v3)
   InFailedSQLTransactionError.
 - _update_strategy_stats: ALTER TABLE DDL likewise moved to a raw AUTOCOMMIT
   connection for the same reason.
+- _persist_run + _update_strategy_stats (v4): Fixed MissingGreenlet error.
+  execution_options(isolation_level="AUTOCOMMIT") must be called on the
+  *engine* BEFORE .connect(), not on the connection after the fact.
+  The correct pattern is:
+      engine.execution_options(isolation_level="AUTOCOMMIT").connect()
+  Calling it on the connection inside the async-with block is too late —
+  asyncpg has already begun an implicit transaction by then.
 """
 
 from __future__ import annotations
@@ -480,10 +487,14 @@ async def _persist_run(
     table_name = f"{strategy_name}_run_{run_index}"
 
     # ── DDL phase: raw AUTOCOMMIT connection, outside the session ───────────
-    # Each statement executes and commits immediately — no transaction block.
+    # execution_options() is called on the engine BEFORE .connect() so that
+    # the resulting connection is born with AUTOCOMMIT isolation — this is the
+    # correct asyncpg pattern.  Calling execution_options() on the connection
+    # after the fact (inside the async with block) does NOT work because asyncpg
+    # has already begun an implicit transaction by the time the first execute()
+    # runs.  Setting it on the engine first avoids that race entirely.
     engine = db.get_bind()
-    async with engine.connect() as raw_conn:
-        await raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as raw_conn:
 
         await raw_conn.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
 
@@ -518,7 +529,7 @@ async def _persist_run(
                 predicted_direction TEXT NOT NULL
             )
         """))
-    # raw_conn is closed here; DDL is fully committed via AUTOCOMMIT
+    # raw_conn is closed here; each DDL statement auto-committed immediately
 
     # ── DML phase: use the normal AsyncSession (transactional) ──────────────
     # Insert ledger rows in bulk
@@ -583,8 +594,7 @@ async def _update_strategy_stats(
     try:
         # ── DDL: ensure columns exist (idempotent) via AUTOCOMMIT ───────────
         engine = db.get_bind()
-        async with engine.connect() as raw_conn:
-            await raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+        async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as raw_conn:
             for col_def in [
                 "ADD COLUMN IF NOT EXISTS last_pnl_pct  DOUBLE PRECISION",
                 "ADD COLUMN IF NOT EXISTS last_run_tp   DOUBLE PRECISION",
