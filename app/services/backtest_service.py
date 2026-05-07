@@ -57,7 +57,7 @@ from typing import Optional
 import pandas as pd
 from fastapi import HTTPException, status
 from sqlalchemy import select, func, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, AsyncEngine
 
 from app.models.strategy_model import StrategyRegistry
 from app.models.backtest_model import (
@@ -78,6 +78,19 @@ from app.schemas.backtest_schema import (
     PnLPoint,
     WinLossPoint,
 )
+
+
+# ---------------------------------------------------------------------------
+# DDL helper – gets the AsyncEngine from the session or falls back to import.
+# db.get_bind() on an AsyncSession returns the AsyncEngine when the session
+# was created via async_sessionmaker(bind=engine).  We import directly from
+# session.py as a guaranteed fallback so we always have a true AsyncEngine —
+# never the underlying sync engine — which avoids MissingGreenlet errors.
+# ---------------------------------------------------------------------------
+
+def _get_async_engine(db: "AsyncSession") -> "AsyncEngine":
+    from app.db.session import engine as _session_engine
+    return _session_engine
 
 # ---------------------------------------------------------------------------
 # Ensure project root is on sys.path so BackTest / signals_combiner resolve
@@ -493,8 +506,7 @@ async def _persist_run(
     # after the fact (inside the async with block) does NOT work because asyncpg
     # has already begun an implicit transaction by the time the first execute()
     # runs.  Setting it on the engine first avoids that race entirely.
-    engine = db.get_bind()
-    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as raw_conn:
+    async with _get_async_engine(db).execution_options(isolation_level="AUTOCOMMIT").connect() as raw_conn:
 
         await raw_conn.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
 
@@ -593,8 +605,7 @@ async def _update_strategy_stats(
     """
     try:
         # ── DDL: ensure columns exist (idempotent) via AUTOCOMMIT ───────────
-        engine = db.get_bind()
-        async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as raw_conn:
+        async with _get_async_engine(db).execution_options(isolation_level="AUTOCOMMIT").connect() as raw_conn:
             for col_def in [
                 "ADD COLUMN IF NOT EXISTS last_pnl_pct  DOUBLE PRECISION",
                 "ADD COLUMN IF NOT EXISTS last_run_tp   DOUBLE PRECISION",
