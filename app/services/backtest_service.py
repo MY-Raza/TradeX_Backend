@@ -1,5 +1,5 @@
 """
-TradeX – Backtest Service  (v2)
+TradeX – Backtest Service  (v3)
 Pipeline for POST /backtest/run
 --------------------------------
 1.  Fetch strategy metadata from strategy_registry
@@ -22,6 +22,20 @@ Additional endpoints
 GET  /backtest/strategies                           → dropdown list
 GET  /backtest/runs/{strategy_name}                 → list of saved runs
 GET  /backtest/runs/{strategy_name}/{run_id}/ledger → paginated ledger
+
+FIX LOG (v3)
+-------------
+- _next_run_index: added `await db.rollback()` in except block so a missing
+  run_registry table on first run no longer leaves the session in an aborted
+  transaction state.
+- _persist_run: DDL (CREATE SCHEMA / CREATE TABLE) moved to a dedicated raw
+  AUTOCOMMIT connection obtained from the engine, completely outside the
+  AsyncSession.  PostgreSQL does not allow CREATE SCHEMA inside an implicit
+  transaction block when using asyncpg; running it via the session caused a
+  silent abort that poisoned every subsequent statement with
+  InFailedSQLTransactionError.
+- _update_strategy_stats: ALTER TABLE DDL likewise moved to a raw AUTOCOMMIT
+  connection for the same reason.
 """
 
 from __future__ import annotations
@@ -413,7 +427,16 @@ def _run_engine_with_combiner(
 # ===========================================================================
 
 async def _next_run_index(db: AsyncSession, strategy_name: str) -> int:
-    """Count existing runs for this strategy and return next index (1-based)."""
+    """
+    Count existing runs for this strategy and return the next index (1-based).
+
+    FIX: On the very first run, run_registry does not exist yet, so the query
+    raises an exception.  The original code swallowed that exception without
+    rolling back, leaving the session in an aborted transaction state which
+    then caused every subsequent statement in _persist_run to fail with
+    InFailedSQLTransactionError.  We now explicitly rollback so the session is
+    clean when _persist_run takes over.
+    """
     try:
         stmt = select(func.count()).select_from(RUN_REGISTRY_TABLE).where(
             RUN_REGISTRY_TABLE.c.strategy_name == strategy_name
@@ -421,7 +444,9 @@ async def _next_run_index(db: AsyncSession, strategy_name: str) -> int:
         count = (await db.execute(stmt)).scalar() or 0
         return count + 1
     except Exception:
-        # run_registry table may not exist yet – will be created on first insert
+        # run_registry table may not exist yet on first ever run.
+        # MUST rollback so the session is not left in an aborted state.
+        await db.rollback()
         return 1
 
 
@@ -443,17 +468,26 @@ async def _persist_run(
     """
     Create backtest_runs schema + tables if needed, insert ledger rows and a
     run_registry record.  Returns the generated table_name.
+
+    FIX: DDL (CREATE SCHEMA / CREATE TABLE) is executed on a raw AUTOCOMMIT
+    connection obtained directly from the engine, completely outside the
+    AsyncSession.  Running DDL through the session causes asyncpg to wrap it
+    in an implicit transaction; PostgreSQL silently aborts that transaction on
+    CREATE SCHEMA, which poisons every subsequent statement with
+    InFailedSQLTransactionError.  AUTOCOMMIT mode executes each DDL statement
+    immediately with no surrounding transaction block.
     """
     table_name = f"{strategy_name}_run_{run_index}"
 
-    # ── DDL phase: create schema + tables and commit immediately ────────────
-    # These CREATE IF NOT EXISTS statements must run in their own committed
-    # transaction so that a later DML failure cannot roll them back and leave
-    # the session in an aborted state for the next request.
-    try:
-        await db.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
+    # ── DDL phase: raw AUTOCOMMIT connection, outside the session ───────────
+    # Each statement executes and commits immediately — no transaction block.
+    engine = db.get_bind()
+    async with engine.connect() as raw_conn:
+        await raw_conn.execution_options(isolation_level="AUTOCOMMIT")
 
-        await db.execute(text("""
+        await raw_conn.execute(text("CREATE SCHEMA IF NOT EXISTS backtest_runs"))
+
+        await raw_conn.execute(text("""
             CREATE TABLE IF NOT EXISTS backtest_runs.run_registry (
                 id            SERIAL PRIMARY KEY,
                 table_name    TEXT NOT NULL UNIQUE,
@@ -471,7 +505,7 @@ async def _persist_run(
             )
         """))
 
-        await db.execute(text(f"""
+        await raw_conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS backtest_runs."{table_name}" (
                 id                  SERIAL PRIMARY KEY,
                 datetime            TIMESTAMP NOT NULL,
@@ -484,13 +518,9 @@ async def _persist_run(
                 predicted_direction TEXT NOT NULL
             )
         """))
+    # raw_conn is closed here; DDL is fully committed via AUTOCOMMIT
 
-        # Commit DDL immediately so it is never rolled back by a later error
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
-
+    # ── DML phase: use the normal AsyncSession (transactional) ──────────────
     # Insert ledger rows in bulk
     if not df_ledger.empty:
         rows_to_insert = []
@@ -543,18 +573,29 @@ async def _update_strategy_stats(
     take_profit: float,
     stop_loss: float,
 ) -> None:
-    """Persist last_pnl_pct, last_run_tp, last_run_sl back to strategy_registry."""
-    try:
-        # Ensure columns exist (idempotent) – DDL committed immediately
-        for col_def in [
-            "ADD COLUMN IF NOT EXISTS last_pnl_pct  DOUBLE PRECISION",
-            "ADD COLUMN IF NOT EXISTS last_run_tp   DOUBLE PRECISION",
-            "ADD COLUMN IF NOT EXISTS last_run_sl   DOUBLE PRECISION",
-        ]:
-            await db.execute(text(f"ALTER TABLE strategies.strategy_registry {col_def}"))
-        await db.commit()
+    """
+    Persist last_pnl_pct, last_run_tp, last_run_sl back to strategy_registry.
 
-        # DML in its own transaction
+    FIX: ALTER TABLE DDL is moved to a raw AUTOCOMMIT connection for the same
+    reason as _persist_run — DDL inside a session transaction is silently
+    aborted by asyncpg/PostgreSQL and leaves the session broken.
+    """
+    try:
+        # ── DDL: ensure columns exist (idempotent) via AUTOCOMMIT ───────────
+        engine = db.get_bind()
+        async with engine.connect() as raw_conn:
+            await raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+            for col_def in [
+                "ADD COLUMN IF NOT EXISTS last_pnl_pct  DOUBLE PRECISION",
+                "ADD COLUMN IF NOT EXISTS last_run_tp   DOUBLE PRECISION",
+                "ADD COLUMN IF NOT EXISTS last_run_sl   DOUBLE PRECISION",
+            ]:
+                await raw_conn.execute(
+                    text(f"ALTER TABLE strategies.strategy_registry {col_def}")
+                )
+        # raw_conn closed; each ALTER committed immediately via AUTOCOMMIT
+
+        # ── DML: update stats via the normal session ─────────────────────────
         await db.execute(
             text("""
                 UPDATE strategies.strategy_registry
@@ -765,6 +806,7 @@ async def get_strategy_runs(
         )
         rows = (await db.execute(stmt)).fetchall()
     except Exception:
+        await db.rollback()
         return []
 
     return [
