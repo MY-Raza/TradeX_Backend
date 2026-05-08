@@ -365,6 +365,7 @@ async def read_ohlcv(
     candles: list[OHLCVCandle] = [
         OHLCVCandle(
             time=ts.strftime(fmt),
+            date=ts.strftime("%Y-%m-%d"),   # ← raw ISO date for frontend filtering
             open=round(row.open, 4),
             high=round(row.high, 4),
             low=round(row.low, 4),

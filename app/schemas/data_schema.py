@@ -85,7 +85,8 @@ class LastDateResponse(BaseModel):
 # ===========================================================================
 
 class OHLCVCandle(BaseModel):
-    time: str = Field(..., description="Formatted timestamp label shown on the X-axis")
+    time: str  = Field(..., description="Formatted timestamp label shown on the X-axis")
+    date: str  = Field(..., description="ISO date string YYYY-MM-DD used for client-side filtering")
     open: float
     high: float
     low: float
