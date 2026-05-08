@@ -5,7 +5,8 @@ Responsibilities
 ----------------
 1. Return exchange list and per-exchange coin list (static catalogue)
 2. Run the correct fetcher in a thread-pool worker (non-blocking)
-3. Read OHLCV candles from the DB and resample to the requested timeframe
+3. Read OHLCV candles from the DB filtered by an optional date range
+   (no resampling on the Data tab – 1-min candles only)
 4. Return chart-ready OHLCVCandle objects to the router
 """
 
@@ -48,19 +49,8 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 # ---------------------------------------------------------------------------
-# Timeframe → pandas resample rule
-# ---------------------------------------------------------------------------
-TIMEFRAME_RESAMPLE: dict[str, str] = {
-    "1m":  "1min",
-    "5m":  "5min",
-    "15m": "15min",
-    "1h":  "1h",
-    "4h":  "4h",
-    "1d":  "1D",
-}
-
-# ---------------------------------------------------------------------------
 # Timeframe → X-axis time format for frontend labels
+# (Only 1m is used on the Data tab, but kept for completeness)
 # ---------------------------------------------------------------------------
 TIMEFRAME_FMT: dict[str, str] = {
     "1m":  "%b %d, %H:%M",
@@ -71,17 +61,8 @@ TIMEFRAME_FMT: dict[str, str] = {
     "1d":  "%b %d, %Y",
 }
 
-# ---------------------------------------------------------------------------
-# How many candles to return per timeframe (keeps chart readable)
-# ---------------------------------------------------------------------------
-TIMEFRAME_LIMIT: dict[str, int] = {
-    "1m":  120,
-    "5m":  120,
-    "15m": 96,
-    "1h":  72,
-    "4h":  60,
-    "1d":  90,
-}
+# Default cap when neither start_date nor end_date is provided
+_DEFAULT_CANDLE_LIMIT = 120
 
 
 # ===========================================================================
@@ -282,55 +263,64 @@ async def get_last_date_for_coin(
 
 
 # ===========================================================================
-# OHLCV reader
+# OHLCV reader  –  SQL-level date filtering, no resampling
 # ===========================================================================
 
 async def read_ohlcv(
     db: AsyncSession,
     exchange: str,
     symbol: str,
-    timeframe: str = "1h",
+    timeframe: str = "1m",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> OHLCVResponse:
     """
-    Read candles from the DB, resample to the requested timeframe,
-    and return chart-ready data.
+    Read 1-minute candles from the DB, filtered by the requested date range,
+    and return chart-ready data.  No resampling is performed on the Data tab.
+
+    When neither start_date nor end_date is given, the most recent
+    _DEFAULT_CANDLE_LIMIT candles are returned (same behaviour as before).
+
+    Parameters
+    ----------
+    start_date : ISO date/datetime string, inclusive (e.g. "2024-01-01")
+    end_date   : ISO date/datetime string, inclusive (e.g. "2024-03-31")
     """
     exchange = exchange.lower()
-    # Normalize: "btc/usdt" or "BTC/USDT" → "btc"
-    symbol = symbol.lower().split("/")[0].split("-")[0].strip()
+    symbol   = symbol.lower().split("/")[0].split("-")[0].strip()
 
-    # Validate inputs
     if exchange not in EXCHANGE_SCHEMA_MAP:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown exchange '{exchange}'.",
         )
-    if timeframe not in TIMEFRAME_RESAMPLE:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown timeframe '{timeframe}'. "
-                   f"Valid: {list(TIMEFRAME_RESAMPLE.keys())}",
-        )
 
     schema     = EXCHANGE_SCHEMA_MAP[exchange]
     table_name = f"{symbol}_1m"
-    limit      = TIMEFRAME_LIMIT[timeframe]
+    tbl        = get_ohlcv_table(schema, table_name)
 
-    # ── Build dynamic table and query ────────────────────────────────────
-    tbl = get_ohlcv_table(schema, table_name)
-
+    # ── Build the query with optional date filters ────────────────────────
     try:
-        # Fetch the last N*resample_factor rows to have enough data after resampling.
-        # For 1d resampling we need ~90 days * 1440 min = 129 600 raw rows.
-        # We cap raw fetch at 200k rows for performance.
-        raw_limit = min(limit * 1440, 200_000)
-        stmt = (
-            select(tbl)
-            .order_by(tbl.c.datetime.desc())
-            .limit(raw_limit)
-        )
+        stmt = select(tbl).order_by(tbl.c.datetime.asc())
+
+        if start_date:
+            # Cast the date string to timestamptz inside SQL (mirrors backtest_service)
+            stmt = stmt.where(
+                tbl.c.datetime >= text(f"'{start_date}'::timestamptz")
+            )
+        if end_date:
+            # Include the full end day: push end to end-of-day if only a date is given
+            end_ts = end_date if "T" in end_date or " " in end_date else f"{end_date}T23:59:59"
+            stmt = stmt.where(
+                tbl.c.datetime <= text(f"'{end_ts}'::timestamptz")
+            )
+
+        # Cap to _DEFAULT_CANDLE_LIMIT when no explicit range is supplied
+        if not start_date and not end_date:
+            stmt = stmt.order_by(tbl.c.datetime.desc()).limit(_DEFAULT_CANDLE_LIMIT)
+
         result = await db.execute(stmt)
-        rows = result.fetchall()
+        rows   = result.fetchall()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -341,38 +331,28 @@ async def read_ohlcv(
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No data found for {exchange}/{symbol}. "
-                   "Please fetch data first.",
+            detail=f"No data found for {exchange}/{symbol} in the requested range. "
+                   "Please fetch data first or adjust the date filter.",
         )
 
-    # ── Build DataFrame ───────────────────────────────────────────────────
+    # ── Build DataFrame and sort ascending ───────────────────────────────
     df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    df = df.sort_values("datetime").set_index("datetime")
+    df = df.sort_values("datetime").reset_index(drop=True)
 
-    # ── Resample ──────────────────────────────────────────────────────────
-    rule = TIMEFRAME_RESAMPLE[timeframe]
-    ohlcv = df.resample(rule).agg(
-        open=("open",   "first"),
-        high=("high",   "max"),
-        low=("low",    "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
-    ).dropna().tail(limit)
-
-    # ── Build chart candles ───────────────────────────────────────────────
-    fmt = TIMEFRAME_FMT[timeframe]
+    # ── Build chart candles (1m, no resampling) ──────────────────────────
+    fmt = TIMEFRAME_FMT.get(timeframe, "%b %d, %H:%M")
     candles: list[OHLCVCandle] = [
         OHLCVCandle(
-            time=ts.strftime(fmt),
-            date=ts.strftime("%Y-%m-%d"),   # ← raw ISO date for frontend filtering
+            time=row.datetime.strftime(fmt),
+            date=row.datetime.strftime("%Y-%m-%d"),   # ISO date for any residual client filtering
             open=round(row.open, 4),
             high=round(row.high, 4),
             low=round(row.low, 4),
             close=round(row.close, 4),
             volume=round(row.volume, 2),
         )
-        for ts, row in ohlcv.iterrows()
+        for row in df.itertuples()
     ]
 
     # ── Summary stats ─────────────────────────────────────────────────────

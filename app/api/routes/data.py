@@ -40,10 +40,6 @@ DB = Annotated[AsyncSession, Depends(get_db)]
     "/exchanges",
     response_model=list[ExchangeInfo],
     summary="List supported exchanges",
-    description=(
-        "Returns all supported exchange identifiers and their display labels. "
-        "Use the `id` field as the `exchange` value in subsequent requests."
-    ),
 )
 async def list_exchanges() -> list[ExchangeInfo]:
     return data_service.get_exchanges()
@@ -57,15 +53,7 @@ async def list_exchanges() -> list[ExchangeInfo]:
     "/coins/{exchange}",
     response_model=list[CoinInfo],
     summary="List coins for an exchange",
-    description=(
-        "Returns all tradable coins available for the given exchange. "
-        "Use `symbol` as the `symbol` value in fetch and OHLCV requests."
-    ),
-    responses={
-        status.HTTP_400_BAD_REQUEST: {
-            "description": "Unknown exchange id supplied.",
-        }
-    },
+    responses={status.HTTP_400_BAD_REQUEST: {"description": "Unknown exchange id."}},
 )
 async def list_coins(exchange: str) -> list[CoinInfo]:
     return data_service.get_coins(exchange)
@@ -79,17 +67,7 @@ async def list_coins(exchange: str) -> list[CoinInfo]:
     "/last-date",
     response_model=LastDateResponse,
     summary="Get the last stored candle datetime for a coin",
-    description=(
-        "Returns the most recent stored candle datetime for the given exchange "
-        "and symbol. If no data exists yet, `last_date` is null. "
-        "The frontend uses this to pre-fill the start_date field and to "
-        "decide whether to lock the date picker."
-    ),
-    responses={
-        status.HTTP_400_BAD_REQUEST: {
-            "description": "Unknown exchange id supplied.",
-        }
-    },
+    responses={status.HTTP_400_BAD_REQUEST: {"description": "Unknown exchange id."}},
 )
 async def get_last_date(
     db: DB,
@@ -107,19 +85,9 @@ async def get_last_date(
     "/fetch",
     response_model=FetchResponse,
     summary="Fetch and store market data",
-    description=(
-        "Runs the exchange-specific data fetcher for the selected coin, "
-        "saves new 1-minute OHLCV candles to the database, "
-        "and returns a summary of rows written. "
-        "This is the endpoint triggered by the **Fetch Data** button."
-    ),
     responses={
-        status.HTTP_400_BAD_REQUEST: {
-            "description": "Unknown exchange or symbol.",
-        },
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {
-            "description": "Fetcher encountered an error.",
-        },
+        status.HTTP_400_BAD_REQUEST: {"description": "Unknown exchange or symbol."},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Fetcher error."},
     },
 )
 async def fetch_data(req: FetchRequest) -> FetchResponse:
@@ -135,36 +103,38 @@ async def fetch_data(req: FetchRequest) -> FetchResponse:
     response_model=OHLCVResponse,
     summary="Get OHLCV chart data",
     description=(
-        "Reads saved candles from the database for the selected exchange, "
-        "symbol, and timeframe. Resamples 1-minute base data to the requested "
-        "timeframe and returns chart-ready candles with summary stats. "
-        "Call this after a successful `/data/fetch` request."
+        "Reads saved 1-minute candles from the database for the selected exchange "
+        "and symbol, filtered by the optional start_date / end_date range. "
+        "No resampling is performed — raw 1-minute candles are returned. "
+        "When no date range is supplied the most recent 120 candles are returned."
     ),
     responses={
-        status.HTTP_400_BAD_REQUEST: {
-            "description": "Unknown exchange or timeframe.",
-        },
-        status.HTTP_404_NOT_FOUND: {
-            "description": "No data found — fetch data first.",
-        },
+        status.HTTP_400_BAD_REQUEST: {"description": "Unknown exchange or timeframe."},
+        status.HTTP_404_NOT_FOUND:   {"description": "No data found — fetch data first."},
     },
 )
 async def get_ohlcv(
     db: DB,
-    exchange: Annotated[
-        str,
-        Query(description="Exchange id, e.g. 'binance'"),
-    ],
-    symbol: Annotated[
-        str,
-        Query(description="Coin symbol key, e.g. 'btc'"),
-    ],
+    exchange: Annotated[str, Query(description="Exchange id, e.g. 'binance'")],
+    symbol:   Annotated[str, Query(description="Coin symbol key, e.g. 'btc'")],
     timeframe: Annotated[
         str,
-        Query(
-            description="Candle timeframe: 1m | 5m | 15m | 1h | 4h | 1d",
-            examples={"1h": {"value": "1h"}},
-        ),
-    ] = "1h",
+        Query(description="Candle timeframe label (display only for 1m on Data tab)"),
+    ] = "1m",
+    start_date: Annotated[
+        Optional[str],
+        Query(description="Filter start – ISO date or datetime, e.g. '2024-01-01'"),
+    ] = None,
+    end_date: Annotated[
+        Optional[str],
+        Query(description="Filter end – ISO date or datetime, e.g. '2024-03-31'"),
+    ] = None,
 ) -> OHLCVResponse:
-    return await data_service.read_ohlcv(db, exchange, symbol, timeframe)
+    return await data_service.read_ohlcv(
+        db,
+        exchange,
+        symbol,
+        timeframe,
+        start_date=start_date,
+        end_date=end_date,
+    )
