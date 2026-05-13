@@ -431,7 +431,11 @@ def _run_engine_with_combiner(
     # The DB always stores 1-minute candles. Signals must be computed on the
     # timeframe encoded in the strategy name (e.g. "1h", "15m", "5m") so that
     # indicator periods match what the strategy was trained on.
-    timeframe = _extract_timeframe_from_strategy(strategy_row.strategy)
+    timeframe = (
+    str(strategy_row.timehorizon).strip().lower()
+    if strategy_row.timehorizon
+    else _extract_timeframe_from_strategy(strategy_row.strategy)
+    )
     df_price_resampled = resample_ohlcv(df_price, timeframe)
 
     if df_price_resampled.empty:
