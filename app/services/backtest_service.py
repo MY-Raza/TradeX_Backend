@@ -465,7 +465,7 @@ def _run_engine_with_combiner(
 
     # -- e. BackTest engine --------------------------------------------------
     bt = BackTest(
-        df_price=df_price_resampled,
+        df_price=df_price,
         df_predictions=df_signals,
         starting_balance=req.starting_balance,
         take_profit=req.take_profit,
