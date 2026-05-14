@@ -39,6 +39,15 @@ from app.schemas.strategy_generator_schema import (
     CreateStrategyResponse,
 )
 
+# Reuse the exact same ledger-persistence helpers from backtest_service.
+# This ensures create_strategy writes to backtest_runs in an identical way
+# to POST /backtest/run, so the Run History panel works for both flows.
+from app.services.backtest_service import (
+    _next_run_index,
+    _persist_run,
+    _update_strategy_stats,
+)
+
 # ---------------------------------------------------------------------------
 # Ensure TradeX project root is on sys.path
 # ---------------------------------------------------------------------------
@@ -289,6 +298,7 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
 def _build_response(
     result: dict,
     req: CreateStrategyRequest,
+    run_table_name: Optional[str] = None,
 ) -> CreateStrategyResponse:
     df_ledger: pd.DataFrame = result["df_ledger"]
     final_balance: float = result["final_balance"]
@@ -325,7 +335,7 @@ def _build_response(
     max_w, max_l = _streaks(win_mask)
 
     summary = BacktestSummary(
-        strategy_name=strategy_id,
+        strategy_name=req.name,        # user display name, not the internal sig_* ID
         exchange=req.exchange,
         symbol=req.symbol.lower(),
         starting_balance=req.starting_balance,
@@ -338,7 +348,7 @@ def _build_response(
         loss_rate=loss_rate,
         max_consecutive_wins=max_w,
         max_consecutive_losses=max_l,
-        run_table_name=None,
+        run_table_name=run_table_name,  # set after DB persist
     )
 
     win_loss_data = [
@@ -360,7 +370,7 @@ def _build_response(
         ledger=ledger_entries,
         win_loss_data=win_loss_data,
         pnl_data=pnl_data,
-        message=f"Strategy '{strategy_id}' created and saved to strategy_registry.",
+        message=f"Strategy '{req.name}' created successfully.",
     )
 
 
@@ -372,7 +382,7 @@ async def create_strategy(
     db: AsyncSession,
     req: CreateStrategyRequest,
 ) -> CreateStrategyResponse:
-    """Full pipeline – validate, generate, backtest, save, return."""
+    """Full pipeline – validate, generate, backtest, persist ledger, return."""
 
     # Validate timeframe early (fast, no I/O)
     if req.timeframe.lower() not in VALID_TIMEFRAMES:
@@ -388,6 +398,7 @@ async def create_strategy(
             detail=f"Unknown exchange '{req.exchange}'. Valid: {list(EXCHANGE_SCHEMA_MAP.keys())}",
         )
 
+    # ── Heavy sync work in thread-pool (OHLCV load, signals, backtest) ───────
     try:
         result = await asyncio.to_thread(_generate_and_run_sync, req)
     except ValueError as exc:
@@ -401,4 +412,47 @@ async def create_strategy(
             detail=f"Strategy generation failed: {exc}",
         )
 
-    return _build_response(result, req)
+    # ── Persist ledger to backtest_runs (identical to POST /backtest/run) ─────
+    df_ledger: pd.DataFrame = result["df_ledger"]
+    final_balance: float    = result["final_balance"]
+    total_pnl_pct: float    = result["total_pnl_pct"]
+
+    sell_rows    = df_ledger[df_ledger["action"].str.startswith("sell")]
+    total_trades = len(sell_rows)
+    win_trades   = int((sell_rows["pnl"] > 0).sum())
+    win_rate     = round(win_trades / total_trades * 100, 2) if total_trades else 0.0
+
+    # Index runs under the user display name so Run History shows it correctly.
+    run_index = await _next_run_index(db, req.name)
+
+    # _persist_run / _update_strategy_stats expect a request-like object that
+    # exposes exchange, start_date, end_date, take_profit, stop_loss.
+    # We build a minimal adapter rather than coupling to BacktestRunRequest.
+    class _ReqAdapter:
+        exchange    = req.exchange
+        start_date  = req.start_date
+        end_date    = req.end_date
+        take_profit = req.take_profit
+        stop_loss   = req.stop_loss
+
+    run_table_name = await _persist_run(
+        db            = db,
+        df_ledger     = df_ledger,
+        req           = _ReqAdapter(),
+        strategy_name = req.name,     # user display name, not the internal sig_* ID
+        run_index     = run_index,
+        final_balance = final_balance,
+        total_pnl_pct = total_pnl_pct,
+        total_trades  = total_trades,
+        win_rate      = win_rate,
+    )
+
+    await _update_strategy_stats(
+        db            = db,
+        strategy_name = req.name,
+        total_pnl_pct = total_pnl_pct,
+        take_profit   = req.take_profit,
+        stop_loss     = req.stop_loss,
+    )
+
+    return _build_response(result, req, run_table_name=run_table_name)
