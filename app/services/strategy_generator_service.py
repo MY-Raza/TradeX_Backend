@@ -55,7 +55,6 @@ if _PROJECT_ROOT not in sys.path:
 VALID_TIMEFRAMES = {"1h", "15m", "5m"}
 
 
-
 # ===========================================================================
 # Streak helper (reuse same logic as backtest_service)
 # ===========================================================================
@@ -171,10 +170,11 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
             "in the selected date range. Fetch data first from the Data tab."
         )
 
-    # Strip timezone — psycopg2 returns timestamptz as tz-aware; BackTest
-    # expects tz-naive. Use tz_convert(None) which works whether or not tz
-    # is already present (unlike tz_localize(None) which raises on tz-aware).
-    df_1m["datetime"] = pd.to_datetime(df_1m["datetime"]).dt.tz_convert(None)
+    # Use tz_convert(None) — not tz_localize(None) — to strip timezone.
+    # tz_localize(None) raises TypeError on tz-aware series (pandas >= 2.0);
+    # tz_convert(None) safely removes tz whether or not it is present.
+    _dt = pd.to_datetime(df_1m["datetime"])
+    df_1m["datetime"] = _dt.dt.tz_convert(None) if _dt.dt.tz is not None else _dt
 
     # ── 3. Resample ──────────────────────────────────────────────────────
     df_tf = resample_ohlcv(df_1m, timeframe)
@@ -184,15 +184,15 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
             "Ensure enough historical data exists for the selected date range."
         )
 
-    open_  = df_tf["open"].to_numpy(dtype=np.float64)
-    high   = df_tf["high"].to_numpy(dtype=np.float64)
-    low    = df_tf["low"].to_numpy(dtype=np.float64)
-    close_ = df_tf["close"].to_numpy(dtype=np.float64)
-    volume = df_tf["volume"].to_numpy(dtype=np.float64)
-    # Use .values (numpy array) so tz info is stripped at the source —
-    # identical to what backtest_service does. Passing the raw Series keeps
-    # tz info alive inside signals_combiner, producing tz-aware signal
-    # datetimes that crash BackTest when compared against tz-naive df_1m.
+    open_  = df_tf["open"].values
+    high   = df_tf["high"].values
+    low    = df_tf["low"].values
+    close_ = df_tf["close"].values
+    volume = df_tf["volume"].values
+    # Pass .values (numpy array) not the raw Series so that tz info
+    # is stripped before entering signals_combiner. backtest_service
+    # does the same thing. Passing the Series keeps tz alive and
+    # causes BackTest's np.searchsorted to crash.
     timestamps = df_tf["datetime"].values
 
     # ── 4. Randomise indicators ──────────────────────────────────────────
