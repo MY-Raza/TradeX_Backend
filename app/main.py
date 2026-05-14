@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 import os
 
-from app.api.routes import strategies, models, data, backtest, sentiment, createstrategy
+from app.api.routes import strategies, models, data, backtest, sentiment, createstrategy, ai_route
 from app.db.session import get_db
 
 
@@ -76,6 +76,7 @@ app.include_router(data.router)
 app.include_router(backtest.router)
 app.include_router(sentiment.router)
 app.include_router(createstrategy.router)
+app.include_router(ai_route.router)
 
 
 @app.get("/")
