@@ -33,13 +33,13 @@ import google.generativeai as genai
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.ai_model import (
+from app.models.ai_model import (
     call_gemini,
     extract_function_calls,
     extract_text,
     get_gemini_model,
 )
-from app.ai.ai_schema import (
+from app.schemas.ai_schema import (
     AIChatResponse,
     ChatMessage,
     ToolExecution,

@@ -16,13 +16,13 @@ from fastapi import APIRouter, Depends, Path, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
-from app.ai.ai_schema import (
+from app.schemas.ai_schema import (
     AIChatRequest,
     AIChatResponse,
     AIDeleteHistoryResponse,
     AIHistoryResponse,
 )
-from app.ai import ai_service
+from app.services import ai_service
 
 router = APIRouter(prefix="/ai", tags=["AI"])
 
