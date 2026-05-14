@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
 from google.generativeai.types import GenerateContentResponse
 
 # ---------------------------------------------------------------------------
