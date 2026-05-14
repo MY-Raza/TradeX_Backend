@@ -263,7 +263,7 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
     strategy_df.insert(0, "symbol", symbol)
     strategy_df.insert(0, "sl", str(req.stop_loss))
     strategy_df.insert(0, "tp", str(req.take_profit))
-    strategy_df.insert(0, "strategy", strategy_id)
+    strategy_df.insert(0, "strategy", req.name)  # user-entered display name
     strategy_df.columns = strategy_df.columns.str.lower()
 
     save_df_to_db(
