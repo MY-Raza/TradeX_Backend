@@ -222,6 +222,16 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
     )
 
     # ── 8. Run BackTest on 1m price data ─────────────────────────────────
+    # Strip tz from signals["datetime"] so it matches the tz-naive df_1m.
+    # run_active_signals_with_voting internally calls pd.to_datetime() which
+    # can return tz-aware timestamps (e.g. datetime64[ns, UTC]) even when the
+    # input numpy array looked tz-naive — causing "Cannot compare tz-naive and
+    # tz-aware timestamps" inside BackTest's np.searchsorted calls.
+    _sig_dt = pd.to_datetime(signals["datetime"])
+    signals["datetime"] = (
+        _sig_dt.dt.tz_convert(None) if _sig_dt.dt.tz is not None else _sig_dt
+    )
+
     bt = BackTest(
         df_price=df_1m,
         df_predictions=signals,
