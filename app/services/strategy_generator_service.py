@@ -55,6 +55,24 @@ if _PROJECT_ROOT not in sys.path:
 VALID_TIMEFRAMES = {"1h", "15m", "5m"}
 
 
+# ---------------------------------------------------------------------------
+# Timezone helper
+# ---------------------------------------------------------------------------
+
+def _strip_tz(dt_series: pd.Series) -> pd.Series:
+    """
+    Normalise a datetime Series to tz-naive (UTC wall-clock time preserved).
+    Handles three cases:
+      - Already tz-naive  → returned as-is
+      - tz-aware          → converted to UTC then tz info stripped
+      - object dtype      → parsed to datetime first
+    """
+    s = pd.to_datetime(dt_series)
+    if s.dt.tz is not None:
+        return s.dt.tz_convert("UTC").dt.tz_localize(None)
+    return s
+
+
 # ===========================================================================
 # Streak helper (reuse same logic as backtest_service)
 # ===========================================================================
@@ -170,7 +188,8 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
             "in the selected date range. Fetch data first from the Data tab."
         )
 
-    df_1m["datetime"] = pd.to_datetime(df_1m["datetime"]).dt.tz_localize(None)
+    # ── Strip timezone from df_1m (always tz-naive from here on) ─────────
+    df_1m["datetime"] = _strip_tz(df_1m["datetime"])
 
     # ── 3. Resample ──────────────────────────────────────────────────────
     df_tf = resample_ohlcv(df_1m, timeframe)
@@ -179,6 +198,9 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
             f"Resampling 1m data to '{timeframe}' produced an empty DataFrame. "
             "Ensure enough historical data exists for the selected date range."
         )
+
+    # Ensure resampled timestamps are also tz-naive
+    df_tf["datetime"] = _strip_tz(df_tf["datetime"])
 
     open_  = df_tf["open"].values
     high   = df_tf["high"].values
@@ -200,6 +222,10 @@ def _generate_and_run_sync(req: CreateStrategyRequest) -> dict:
             "Signal combiner returned no signals for the selected date range. "
             "Try a wider date range or a different timeframe."
         )
+
+    # Ensure signals datetime column is tz-naive so BackTest comparisons
+    # against df_1m (already tz-naive) never raise "tz-naive vs tz-aware"
+    signals["datetime"] = _strip_tz(signals["datetime"])
 
     # ── 6. Generate strategy ID ──────────────────────────────────────────
     strategy_id = generate_strategy_id(symbol, flags, timeframe=timeframe)
