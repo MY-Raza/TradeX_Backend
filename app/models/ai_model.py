@@ -537,19 +537,23 @@ def extract_tool_calls(response: ChatCompletion) -> list[dict[str, Any]]:
         return calls
 
     for tc in message.tool_calls:
-        try:
-            args = _json.loads(tc.function.arguments)
-        except (_json.JSONDecodeError, AttributeError):
-            logger.warning(
-                "extract_tool_calls | malformed args for tool '%s': %s",
-                tc.function.name, tc.function.arguments,
-            )
-            args = {}
+        raw_args = getattr(tc.function, "arguments", None)
+        args: dict[str, Any] = {}
+        if raw_args:
+            try:
+                parsed = _json.loads(raw_args)
+                # Llama 3.3 occasionally returns a JSON null or non-dict
+                args = parsed if isinstance(parsed, dict) else {}
+            except (_json.JSONDecodeError, TypeError, ValueError):
+                logger.warning(
+                    "extract_tool_calls | malformed args for tool '%s': %r",
+                    tc.function.name, raw_args,
+                )
 
         calls.append({
             "id": tc.id,
             "name": tc.function.name,
-            "args": args,
+            "args": args,   # always a dict, never None
         })
 
     return calls

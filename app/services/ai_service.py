@@ -452,7 +452,7 @@ async def process_chat(
         # ── Dispatch each tool call ────────────────────────────────────────
         for tc in tool_calls:
             tool_name = tc["name"]
-            args = tc.get("args", {})
+            args: dict[str, Any] = tc.get("args") or {}
             tool_call_id = tc["id"]
 
             logger.debug(
