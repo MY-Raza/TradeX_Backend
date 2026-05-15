@@ -1,51 +1,66 @@
 """
-TradeX – AI Orchestration Service
+TradeX – AI Orchestration Service (Groq / Llama 3.3-70B)
+=========================================================
 
 Responsibilities
 ----------------
-1.  Maintain per-session conversation history (in-memory, keyed by session_id)
-2.  Receive a user prompt and build the Gemini conversation context
-3.  Send the prompt to Gemini; parse any function_call parts in the response
-4.  Dispatch function calls to the EXISTING backend service functions
-5.  Feed tool results back to Gemini for a final natural-language reply
-6.  Return AIChatResponse with structured data + the tool execution trace
+1.  Maintain per-session conversation history in-memory (keyed by session_id)
+2.  Receive a user prompt and build a full OpenAI-format messages list
+3.  Send the prompt to Groq via the OpenAI-compatible SDK
+4.  Parse ``tool_calls`` from the response and dispatch to backend services
+5.  Inject tool results back as ``role="tool"`` messages and loop
+6.  Return AIChatResponse with the final text reply + tool execution trace
 
-Design notes
-------------
-- All calls to existing services go through the same async functions already
-  used by the FastAPI routes – no duplication, no re-implementation.
-- History is stored as a list of Gemini-format dicts so the same list can be
-  passed directly to model.start_chat(history=...).
-- Tool result payloads are serialised to JSON-compatible dicts before being
-  sent back to Gemini as function_response parts.
-- The orchestration loop runs at most MAX_TOOL_ROUNDS rounds to prevent
-  infinite loops when the model keeps requesting tools.
+Migration notes vs. Gemini implementation
+------------------------------------------
+| Gemini concept                     | OpenAI/Groq replacement              |
+|------------------------------------|--------------------------------------|
+| role="model"                       | role="assistant"                     |
+| role="user" (function_response)    | role="tool"  (tool_call_id required) |
+| parts=[{"function_call": ...}]     | message.tool_calls=[...]             |
+| parts=[{"function_response": ...}] | {"role":"tool","tool_call_id":...}   |
+| chat.send_message(msg)             | client.chat.completions.create(...)  |
+| asyncio.to_thread(chat.send_msg)   | native await (Groq SDK is async)     |
+| model.start_chat(history=...)      | full messages[] list each request    |
+
+Key architectural improvements over Gemini version
+---------------------------------------------------
+- No thread-executor overhead: Groq client is fully async.
+- Tool results carry ``tool_call_id`` for strict protocol compliance.
+- History format is standard OpenAI messages[] – portable to any compatible LLM.
+- ``parallel_tool_calls=True`` enables fan-out in a single round (same as Gemini).
+- Structured debug logging for every tool call and LLM round.
+- Timeout guard via ``asyncio.wait_for`` on every Groq call.
+- Malformed tool-argument recovery: bad JSON is caught, logged, and the tool
+  receives an empty args dict rather than crashing the whole request.
+- Token budget awareness: history is pruned before it overflows context.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import google.generativeai as genai
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ai_model import (
-    call_gemini,
-    extract_function_calls,
+    SYSTEM_PROMPT,
+    build_assistant_tool_call_message,
+    build_tool_result_message,
+    call_groq,
     extract_text,
-    get_gemini_model,
+    extract_tool_calls,
 )
 from app.schemas.ai_schema import (
     AIChatResponse,
     ChatMessage,
     ToolExecution,
 )
-
-# Existing service imports – called directly, no wrappers needed
 from app.services import (
     backtest_service,
     data_service,
@@ -57,21 +72,26 @@ from app.schemas.backtest_schema import BacktestRunRequest
 from app.schemas.sentiment_schema import SentimentRunRequest
 
 # ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("tradex.ai.service")
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_ROUNDS: int = 5  # maximum tool-call → result cycles per request
+MAX_TOOL_ROUNDS: int = 5       # maximum tool-call → result cycles per request
+_GROQ_TIMEOUT: float = 60.0    # seconds to wait for each Groq API call
+_MAX_HISTORY_MESSAGES: int = 50  # trim window to prevent context overflow
 
 # ---------------------------------------------------------------------------
 # In-memory session store
-# Maps session_id → list of Gemini-format history dicts
-# Replace with Redis/DB persistence for production multi-instance deployments.
+# Maps session_id → list[dict] in OpenAI messages format
+# Replace with Redis for multi-instance production deployments.
 # ---------------------------------------------------------------------------
 
 _SESSION_STORE: dict[str, list[dict[str, Any]]] = {}
-
-# Maximum messages kept per session (prevents unbounded growth)
-_MAX_HISTORY_MESSAGES: int = 50
 
 
 # ===========================================================================
@@ -79,52 +99,55 @@ _MAX_HISTORY_MESSAGES: int = 50
 # ===========================================================================
 
 def _get_or_create_session(session_id: Optional[str]) -> str:
-    """Return an existing session id or create a new one."""
+    """Return existing session id or create a new one."""
     if not session_id or session_id not in _SESSION_STORE:
         sid = session_id or str(uuid.uuid4())
-        _SESSION_STORE[sid] = []
+        # Seed with system prompt so every conversation starts with it
+        _SESSION_STORE[sid] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
         return sid
     return session_id
 
 
-def _append_to_history(
-    session_id: str,
-    role: str,           # "user" | "model"
-    parts: list[Any],
-) -> None:
-    history = _SESSION_STORE.setdefault(session_id, [])
-    history.append({"role": role, "parts": parts})
-    # Trim to keep only the most recent messages
+def _append_message(session_id: str, message: dict[str, Any]) -> None:
+    """
+    Append one OpenAI-format message dict to the session history and trim if
+    the history exceeds _MAX_HISTORY_MESSAGES.
+
+    The system message at index 0 is always preserved during trimming so the
+    model never loses its instructions.
+    """
+    history = _SESSION_STORE.setdefault(
+        session_id, [{"role": "system", "content": SYSTEM_PROMPT}]
+    )
+    history.append(message)
     if len(history) > _MAX_HISTORY_MESSAGES:
-        _SESSION_STORE[session_id] = history[-_MAX_HISTORY_MESSAGES:]
+        # Keep system message + most recent (_MAX_HISTORY_MESSAGES - 1) turns
+        _SESSION_STORE[session_id] = [history[0]] + history[-(
+            _MAX_HISTORY_MESSAGES - 1
+        ):]
 
 
 def get_session_messages(session_id: str) -> list[ChatMessage]:
     """
     Return conversation history as ChatMessage objects for GET /ai/history.
-    Filters to text-only parts; skips function_call / function_response parts.
+    Filters to user and assistant text turns only; skips tool messages.
     """
     history = _SESSION_STORE.get(session_id, [])
     messages: list[ChatMessage] = []
+    ts = datetime.now(timezone.utc).isoformat()
     for turn in history:
-        role = turn.get("role", "user")
-        for part in turn.get("parts", []):
-            if isinstance(part, dict) and "text" in part:
-                messages.append(
-                    ChatMessage(
-                        role="user" if role == "user" else "assistant",
-                        content=part["text"],
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                    )
+        role = turn.get("role")
+        content = turn.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content:
+            messages.append(
+                ChatMessage(
+                    role=role,  # type: ignore[arg-type]
+                    content=content,
+                    timestamp=ts,
                 )
-            elif isinstance(part, str):
-                messages.append(
-                    ChatMessage(
-                        role="user" if role == "user" else "assistant",
-                        content=part,
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                    )
-                )
+            )
     return messages
 
 
@@ -138,7 +161,7 @@ def delete_session(session_id: str) -> bool:
 
 # ===========================================================================
 # Tool dispatcher
-# Maps Gemini function_call names → actual backend service calls
+# Routes OpenAI tool_call names → backend service functions
 # ===========================================================================
 
 async def _dispatch_tool(
@@ -147,9 +170,11 @@ async def _dispatch_tool(
     db: AsyncSession,
 ) -> Any:
     """
-    Route a Gemini function_call to the correct backend service function.
+    Route a tool call to the correct backend service function.
+
     Returns the Pydantic model or primitive from the service.
-    Raises HTTPException (propagated) or returns an error dict on service error.
+    Raises HTTPException (propagated to caller) on service-level errors.
+    Raises ValueError for unknown tool names.
     """
 
     # ── Strategies ─────────────────────────────────────────────────────────
@@ -164,7 +189,9 @@ async def _dispatch_tool(
         )
 
     if tool_name == "get_strategy_detail":
-        result = await strategy_service.get_strategy_by_name(db, args["strategy_name"])
+        result = await strategy_service.get_strategy_by_name(
+            db, args["strategy_name"]
+        )
         if result is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -172,11 +199,11 @@ async def _dispatch_tool(
             )
         return result
 
-    # ── Backtest strategies dropdown ───────────────────────────────────────
+    # ── Backtest strategies dropdown ────────────────────────────────────────
     if tool_name == "get_backtest_strategies":
         return await backtest_service.get_backtest_strategies(db)
 
-    # ── Run backtest ───────────────────────────────────────────────────────
+    # ── Run backtest ────────────────────────────────────────────────────────
     if tool_name == "run_backtest":
         req = BacktestRunRequest(
             strategy_name=args["strategy_name"],
@@ -193,11 +220,11 @@ async def _dispatch_tool(
         )
         return await backtest_service.run_backtest(db, req)
 
-    # ── Strategy run history ───────────────────────────────────────────────
+    # ── Strategy run history ────────────────────────────────────────────────
     if tool_name == "get_strategy_runs":
         return await backtest_service.get_strategy_runs(db, args["strategy_name"])
 
-    # ── Models ────────────────────────────────────────────────────────────
+    # ── ML / DL models ─────────────────────────────────────────────────────
     if tool_name == "get_models":
         model_type = args.get("model_type", "ml").lower()
         if model_type not in ("ml", "dl"):
@@ -225,7 +252,7 @@ async def _dispatch_tool(
             )
         return result
 
-    # ── Sentiment ─────────────────────────────────────────────────────────
+    # ── Sentiment ───────────────────────────────────────────────────────────
     if tool_name == "get_sentiment_results":
         return await sentiment_service.get_sentiment_results(db, args["coin"])
 
@@ -233,7 +260,7 @@ async def _dispatch_tool(
         req = SentimentRunRequest(coin=args["coin"])
         return await sentiment_service.run_sentiment(db, req)
 
-    # ── OHLCV ─────────────────────────────────────────────────────────────
+    # ── OHLCV ───────────────────────────────────────────────────────────────
     if tool_name == "get_ohlcv":
         return await data_service.read_ohlcv(
             db,
@@ -250,11 +277,14 @@ async def _dispatch_tool(
     )
 
 
+# ===========================================================================
+# Result serialisation helpers (unchanged from Gemini version)
+# ===========================================================================
+
 def _serialise_result(result: Any) -> dict[str, Any]:
     """
     Convert a service result to a JSON-serialisable dict.
-    Pydantic models are serialised via .model_dump(); lists are handled
-    element-wise; primitives are wrapped in {"value": ...}.
+    Pydantic models → .model_dump(); lists → element-wise; primitives wrapped.
     """
     if result is None:
         return {}
@@ -272,10 +302,7 @@ def _serialise_result(result: Any) -> dict[str, Any]:
 
 
 def _result_summary(tool_name: str, result: Any) -> str:
-    """
-    Generate a short human-readable summary of a tool result.
-    Used to populate ToolExecution.result_summary for the response envelope.
-    """
+    """Generate a short human-readable summary of a tool result."""
     try:
         if tool_name == "get_strategies":
             return f"Found {result.total} strategies (page {result.page}/{result.pages})"
@@ -283,7 +310,8 @@ def _result_summary(tool_name: str, result: Any) -> str:
             return (
                 f"Strategy '{result.name}': {len(result.indicators)} indicators, "
                 f"{len(result.patterns)} patterns, last PnL: "
-                f"{result.last_pnl_pct:.2f}%" if result.last_pnl_pct is not None
+                f"{result.last_pnl_pct:.2f}%"
+                if result.last_pnl_pct is not None
                 else f"Strategy '{result.name}' loaded"
             )
         if tool_name == "get_backtest_strategies":
@@ -300,7 +328,7 @@ def _result_summary(tool_name: str, result: Any) -> str:
         if tool_name == "get_strategy_runs":
             count = len(result) if isinstance(result, list) else "?"
             return f"Found {count} historical run(s)"
-        if tool_name in ("get_models",):
+        if tool_name == "get_models":
             return f"Found {result.total} {result.model_type.upper()} models"
         if tool_name == "get_model_detail":
             return (
@@ -337,63 +365,100 @@ async def process_chat(
     session_id: Optional[str],
 ) -> AIChatResponse:
     """
-    Full AI orchestration pipeline.
+    Full AI orchestration pipeline (Groq / Llama 3.3-70B).
 
-    1. Retrieve / create session
-    2. Send user message to Gemini (with history)
-    3. If Gemini returns function_calls → dispatch to backend services
-    4. Feed results back to Gemini as function_response → get final text reply
-    5. Persist updated history
-    6. Return AIChatResponse
+    Flow
+    ----
+    1.  Retrieve or create a session; load existing OpenAI-format history.
+    2.  Append the new user turn to history.
+    3.  POST the full messages list to Groq.
+    4.  If the model returns ``tool_calls``:
+          a.  Echo the assistant message (with tool_calls) back into history.
+          b.  Dispatch each tool call to the correct backend service.
+          c.  Append each result as a ``role="tool"`` message.
+          d.  Repeat from step 3 (up to MAX_TOOL_ROUNDS times).
+    5.  When the model returns a plain text reply, persist history and return.
 
-    The loop runs up to MAX_TOOL_ROUNDS times to support multi-step workflows
-    such as: fetch strategies → pick best → run backtest → summarise.
+    Differences from the Gemini orchestration loop
+    -----------------------------------------------
+    - Messages list is passed whole every round (no start_chat abstraction).
+    - Tool results use role="tool" + tool_call_id (not role="user" + parts).
+    - The assistant message that contains tool_calls is echoed back verbatim
+      (required by the OpenAI protocol so the model tracks its own decisions).
+    - Groq call is wrapped in asyncio.wait_for for timeout safety.
+    - Debug logging records every round, every tool call, and every result.
     """
     sid = _get_or_create_session(session_id)
-    model = get_gemini_model()
 
-    # Conversation history for this session (Gemini format)
-    history = list(_SESSION_STORE.get(sid, []))
+    # Append the incoming user message
+    _append_message(sid, {"role": "user", "content": user_message})
+    logger.info("process_chat | session=%s | user_message_len=%d", sid, len(user_message))
 
     tools_executed: list[ToolExecution] = []
     last_structured_data: Optional[dict[str, Any]] = None
     final_reply: str = ""
 
-    # ── Append user turn to history before sending ─────────────────────────
-    _append_to_history(sid, "user", [{"text": user_message}])
-    # Rebuild history reference after append
-    history = list(_SESSION_STORE.get(sid, []))
-    # The last item is the new user turn; pass everything before it as history
-    send_history = history[:-1]
+    # ── Orchestration loop ─────────────────────────────────────────────────
+    for round_num in range(MAX_TOOL_ROUNDS):
+        logger.debug("process_chat | session=%s | round=%d/%d", sid, round_num + 1, MAX_TOOL_ROUNDS)
 
-    # ── Orchestration loop ────────────────────────────────────────────────
-    current_message: str = user_message
+        # Snapshot current history for this round's API call
+        current_messages = list(_SESSION_STORE.get(sid, []))
 
-    for _round in range(MAX_TOOL_ROUNDS):
+        # ── Call Groq (with timeout) ───────────────────────────────────────
         try:
-            response = await call_gemini(model, send_history, current_message)
-        except Exception as exc:
+            response = await asyncio.wait_for(
+                call_groq(current_messages),
+                timeout=_GROQ_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("process_chat | session=%s | Groq timeout after %.1fs", sid, _GROQ_TIMEOUT)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Gemini API error: {exc}",
+                detail=f"Groq API timed out after {_GROQ_TIMEOUT:.0f}s.",
+            )
+        except Exception as exc:
+            logger.error("process_chat | session=%s | Groq error: %s", sid, exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Groq API error: {exc}",
             )
 
-        function_calls = extract_function_calls(response)
+        tool_calls = extract_tool_calls(response)
         text_reply = extract_text(response)
 
-        # No tool calls → model gave a final text answer
-        if not function_calls:
+        # ── No tool calls → model gave final text answer ───────────────────
+        if not tool_calls:
             final_reply = text_reply or "I've completed the requested operations."
-            # Record the model reply in history
-            _append_to_history(sid, "model", [{"text": final_reply}])
+            _append_message(sid, {"role": "assistant", "content": final_reply})
+            logger.info(
+                "process_chat | session=%s | final_reply_len=%d | rounds_used=%d",
+                sid, len(final_reply), round_num + 1,
+            )
             break
 
-        # Process each function call in this round
-        tool_results_for_gemini: list[dict[str, Any]] = []
+        # ── Echo assistant message (with tool_calls) into history ──────────
+        # This is mandatory in the OpenAI protocol – the model must see its
+        # own tool_calls before it receives the tool results.
+        assistant_msg = build_assistant_tool_call_message(response)
+        _append_message(sid, assistant_msg)
 
-        for fc in function_calls:
-            tool_name = fc["name"]
-            args = fc.get("args", {})
+        logger.debug(
+            "process_chat | session=%s | round=%d | tool_calls=%s",
+            sid, round_num + 1,
+            [tc["name"] for tc in tool_calls],
+        )
+
+        # ── Dispatch each tool call ────────────────────────────────────────
+        for tc in tool_calls:
+            tool_name = tc["name"]
+            args = tc.get("args", {})
+            tool_call_id = tc["id"]
+
+            logger.debug(
+                "process_chat | dispatching | tool=%s | args=%s",
+                tool_name, json.dumps(args, default=str)[:200],
+            )
 
             try:
                 result = await _dispatch_tool(tool_name, args, db)
@@ -410,29 +475,42 @@ async def process_chat(
                 )
                 last_structured_data = serialised
 
-                tool_results_for_gemini.append({
-                    "function_response": {
-                        "name": tool_name,
-                        "response": {"content": json.dumps(serialised, default=str)},
-                    }
-                })
+                # Inject successful tool result into history
+                _append_message(
+                    sid,
+                    build_tool_result_message(
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        content=json.dumps(serialised, default=str),
+                    ),
+                )
+                logger.debug(
+                    "process_chat | tool_success | tool=%s | summary=%s",
+                    tool_name, summary,
+                )
 
             except HTTPException as http_exc:
-                error_msg = http_exc.detail
+                error_msg = str(http_exc.detail)
                 tools_executed.append(
                     ToolExecution(
                         tool_name=tool_name,
                         parameters=args,
                         status="error",
-                        error=str(error_msg),
+                        error=error_msg,
                     )
                 )
-                tool_results_for_gemini.append({
-                    "function_response": {
-                        "name": tool_name,
-                        "response": {"error": str(error_msg)},
-                    }
-                })
+                _append_message(
+                    sid,
+                    build_tool_result_message(
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        content=json.dumps({"error": error_msg}),
+                    ),
+                )
+                logger.warning(
+                    "process_chat | tool_http_error | tool=%s | error=%s",
+                    tool_name, error_msg,
+                )
 
             except Exception as exc:
                 error_msg = str(exc)
@@ -444,43 +522,35 @@ async def process_chat(
                         error=error_msg,
                     )
                 )
-                tool_results_for_gemini.append({
-                    "function_response": {
-                        "name": tool_name,
-                        "response": {"error": error_msg},
-                    }
-                })
-
-        # Append the model's tool-call turn + our results to history so
-        # the next round has full context
-        _append_to_history(
-            sid,
-            "model",
-            [{"function_call": fc} for fc in function_calls],
-        )
-        _append_to_history(
-            sid,
-            "user",  # function_response parts go in the "user" role in Gemini API
-            tool_results_for_gemini,
-        )
-
-        # Rebuild history and prepare for next round (model sees its own
-        # function_calls + our function_responses as the new "current_message")
-        send_history = list(_SESSION_STORE.get(sid, []))[:-1]
-        # Feed the function responses as the next user message content
-        current_message = json.dumps(
-            [r.get("function_response", {}) for r in tool_results_for_gemini],
-            default=str,
-        )
+                _append_message(
+                    sid,
+                    build_tool_result_message(
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        content=json.dumps({"error": error_msg}),
+                    ),
+                )
+                logger.error(
+                    "process_chat | tool_exception | tool=%s | error=%s",
+                    tool_name, error_msg, exc_info=True,
+                )
 
     else:
-        # Reached MAX_TOOL_ROUNDS without a final text reply
+        # MAX_TOOL_ROUNDS exhausted without a plain-text reply
         final_reply = (
             "I've gathered the requested data. Here's a summary of what was executed: "
-            + "; ".join(t.result_summary or t.tool_name for t in tools_executed if t.status == "success")
+            + "; ".join(
+                t.result_summary or t.tool_name
+                for t in tools_executed
+                if t.status == "success"
+            )
             + "."
         )
-        _append_to_history(sid, "model", [{"text": final_reply}])
+        _append_message(sid, {"role": "assistant", "content": final_reply})
+        logger.warning(
+            "process_chat | session=%s | MAX_TOOL_ROUNDS (%d) exhausted",
+            sid, MAX_TOOL_ROUNDS,
+        )
 
     return AIChatResponse(
         session_id=sid,
