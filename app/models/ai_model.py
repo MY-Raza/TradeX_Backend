@@ -38,7 +38,7 @@ if not _API_KEY:
 
 genai.configure(api_key=_API_KEY)
 
-_MODEL_NAME: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+_MODEL_NAME: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 
 # ===========================================================================
