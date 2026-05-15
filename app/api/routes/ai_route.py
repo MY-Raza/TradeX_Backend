@@ -1,13 +1,3 @@
-"""
-TradeX – AI Chat Router
-
-Endpoints
----------
-POST   /ai/chat                          → AIChatResponse
-GET    /ai/history/{session_id}          → AIHistoryResponse
-DELETE /ai/history/{session_id}          → AIDeleteHistoryResponse
-"""
-
 from __future__ import annotations
 
 from typing import Annotated
