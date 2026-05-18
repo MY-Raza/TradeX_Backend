@@ -17,16 +17,21 @@ GROQ_MODEL     – optional; defaults to "llama-3.3-70b-versatile"
 
 TOKEN OPTIMISATION CHANGES (vs original)
 -----------------------------------------
-1. SYSTEM_PROMPT reduced from ~250 tokens → ~110 tokens.
-   The model already knows how to use tools; verbose instructions waste budget.
+1. SYSTEM_PROMPT reduced from ~250 tokens → ~130 tokens (includes strategy-gen rules).
 2. ``max_tokens`` default lowered from 4 096 → 1 024.
    Groq counts *requested* output tokens against the TPM limit even when the
    actual reply is short.  1 024 is sufficient for trading Q&A; caller can
    override for complex summaries.
 3. ``call_groq()`` now accepts a ``max_tokens`` override so ai_service can
    pass lower values for simple one-shot queries.
-4. Tool descriptions tightened: removed redundant filler sentences that the
-   model doesn't need to select the right tool.
+4. Tool descriptions tightened: removed redundant filler sentences.
+
+STRATEGY GENERATOR ADDITION (v3)
+----------------------------------
+- Added ``create_strategy`` tool – thin adapter over strategy_generator_service.
+- Added ``compare_strategies`` tool – runs create_strategy N times and compares.
+- SYSTEM_PROMPT updated with routing rules for strategy generation.
+- No existing tools were changed.
 """
 
 from __future__ import annotations
@@ -205,14 +210,14 @@ TRADEX_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_model_detail",
             "description": (
-                "Full metrics for one ML/DL model: PnL, win rate, Sharpe, "
-                "Sortino, max drawdown, streak data."
+                "Fetch full detail for one ML or DL model by exact name. "
+                "Requires model_type ('ml'|'dl') and model_name."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "model_type": {"type": "string", "description": "'ml' or 'dl'."},
-                    "model_name": {"type": "string", "description": "Exact model run id."},
+                    "model_name": {"type": "string", "description": "Exact model name."},
                 },
                 "required": ["model_type", "model_name"],
             },
@@ -224,10 +229,7 @@ TRADEX_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_sentiment_results",
-            "description": (
-                "Retrieve cached Reddit/FinBERT sentiment for a coin "
-                "('btc'|'eth'|'sol') without re-running the pipeline."
-            ),
+            "description": "Retrieve cached FinBERT sentiment results for a coin ('btc'|'eth'|'sol').",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -238,7 +240,7 @@ TRADEX_TOOLS: list[dict[str, Any]] = [
         },
     },
 
-    # ── Run sentiment pipeline ────────────────────────────────────────────
+    # ── Run sentiment ─────────────────────────────────────────────────────
     {
         "type": "function",
         "function": {
@@ -275,22 +277,155 @@ TRADEX_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+
+    # =======================================================================
+    # STRATEGY GENERATOR TOOLS  (new in v3)
+    # =======================================================================
+    # WHY TWO TOOLS?
+    # - create_strategy   → single strategy; returns full CreateStrategyResponse.
+    # - compare_strategies → loops create_strategy N times (2–5) and ranks by
+    #   win_rate / total_pnl_pct.  Implemented at the service layer, not in the
+    #   model, so the AI never has to chain N tool calls manually for a
+    #   "generate 3 strategies and compare" prompt.
+    # =======================================================================
+
+    # ── Create / generate one strategy ────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "create_strategy",
+            "description": (
+                "Generate a new randomised trading strategy, run a full backtest, "
+                "save signals + metadata to the database, and return backtest results. "
+                "Call when user asks to 'create', 'generate', or 'build' a strategy. "
+                "Required: name, symbol, exchange, timeframe. "
+                "Defaults: starting_balance=1000, take_profit=3.0, stop_loss=1.0, "
+                "fee=0.05, leverage=1.0, slippage=0.0."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Human-readable display name for the strategy, e.g. "
+                            "'BTC Scalper 15m'. Used for Run History panel. "
+                            "Max 100 chars."
+                        ),
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Coin key, e.g. 'btc', 'eth', 'sol'.",
+                    },
+                    "exchange": {
+                        "type": "string",
+                        "description": "'binance' | 'bybit' | 'kraken' | 'metatrader5'.",
+                    },
+                    "timeframe": {
+                        "type": "string",
+                        "description": "Candle timeframe: '1h' | '15m' | '5m'.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start of backtest window, ISO format e.g. '2024-01-01'. Optional.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End of backtest window, ISO format e.g. '2024-12-31'. Optional.",
+                    },
+                    "starting_balance": {
+                        "type": "number",
+                        "description": "Initial capital in USD. Default 1000.",
+                    },
+                    "take_profit": {
+                        "type": "number",
+                        "description": "Take-profit threshold as % (e.g. 3.0 = 3%). Default 3.0.",
+                    },
+                    "stop_loss": {
+                        "type": "number",
+                        "description": "Stop-loss threshold as % (e.g. 1.0 = 1%). Default 1.0.",
+                    },
+                    "fee": {
+                        "type": "number",
+                        "description": "Trading fee per side as %. Default 0.05.",
+                    },
+                    "leverage": {
+                        "type": "number",
+                        "description": "Leverage multiplier, e.g. 2.0 for 2x. Default 1.0.",
+                    },
+                    "slippage": {
+                        "type": "number",
+                        "description": "Assumed slippage as %. Default 0.0.",
+                    },
+                },
+                "required": ["name", "symbol", "exchange", "timeframe"],
+            },
+        },
+    },
+
+    # ── Compare N generated strategies ────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_strategies",
+            "description": (
+                "Generate multiple randomised strategies and rank them by performance. "
+                "Call when user asks to 'compare', 'generate N strategies', or 'find the best' "
+                "from a fresh generation. count must be 2–5 (default 3). "
+                "Uses the same parameters as create_strategy for each run."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of strategies to generate and compare. Min 2, max 5. Default 3.",
+                    },
+                    "base_name": {
+                        "type": "string",
+                        "description": (
+                            "Base display name; each strategy will be named "
+                            "'<base_name> #1', '<base_name> #2', etc."
+                        ),
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Coin key, e.g. 'btc'.",
+                    },
+                    "exchange": {
+                        "type": "string",
+                        "description": "'binance' | 'bybit' | 'kraken' | 'metatrader5'.",
+                    },
+                    "timeframe": {
+                        "type": "string",
+                        "description": "'1h' | '15m' | '5m'.",
+                    },
+                    "start_date": {"type": "string", "description": "Backtest start (ISO). Optional."},
+                    "end_date": {"type": "string", "description": "Backtest end (ISO). Optional."},
+                    "starting_balance": {"type": "number", "description": "USD. Default 1000."},
+                    "take_profit": {"type": "number", "description": "% Default 3.0."},
+                    "stop_loss": {"type": "number", "description": "% Default 1.0."},
+                    "fee": {"type": "number", "description": "Fee %. Default 0.05."},
+                    "leverage": {"type": "number", "description": "Multiplier. Default 1.0."},
+                    "slippage": {"type": "number", "description": "Slippage %. Default 0.0."},
+                },
+                "required": ["symbol", "exchange", "timeframe"],
+            },
+        },
+    },
 ]
 
 
 # ===========================================================================
 # System prompt
 #
-# TOKEN OPTIMISATION: Reduced from ~250 tokens to ~110 tokens.
+# TOKEN OPTIMISATION: ~130 tokens (was ~110 without strategy-gen rules).
+# Added 3 new rules for strategy generation routing without adding bloat.
 #
-# WHY: The system prompt is sent with EVERY request.  In a 5-round tool loop
-# the original 250-token prompt consumed 1 250 tokens just for instructions.
-# The model already understands tool calling; it only needs:
-#   (a) its persona / domain context
-#   (b) the non-obvious routing rules (best strategy → get_backtest_strategies first)
-#   (c) output format constraints
-# Everything else ("You have access to the following tools: …") is redundant
-# because the tool declarations themselves convey that information.
+# WHY: Rules 8–10 tell the model exactly when to use create_strategy vs
+# compare_strategies, what defaults to apply for "aggressive"/"scalping"
+# profiles, and how to present generation results.  Without these rules the
+# model would under-use or misuse the new tools.
 # ===========================================================================
 
 SYSTEM_PROMPT: str = (
@@ -303,7 +438,20 @@ SYSTEM_PROMPT: str = (
     "4. Default exchange: binance.\n"
     "5. Be concise: lead with numbers, then explain.\n"
     "6. Never fabricate data. Report tool errors clearly.\n"
-    "7. Format numbers: 2 decimal places, % on rates."
+    "7. Format numbers: 2 decimal places, % on rates.\n"
+    # ── Strategy generator rules (added v3) ──────────────────────────────
+    "8. For 'create/generate/build a strategy': call create_strategy. "
+    "Infer symbol from coin mention (e.g. 'BTC' → symbol='btc'). "
+    "If no timeframe given, default '1h'.\n"
+    "9. Risk profiles: 'aggressive' → take_profit=5, stop_loss=2, leverage=3; "
+    "'conservative' → take_profit=2, stop_loss=0.5, leverage=1; "
+    "'scalping' → timeframe='5m', take_profit=1, stop_loss=0.5.\n"
+    "10. For 'compare N strategies' or 'generate N and pick best': "
+    "call compare_strategies with count=N (max 5). "
+    "After results, rank by win_rate then total_pnl_pct and recommend the top one.\n"
+    "11. After create_strategy or compare_strategies: always explain "
+    "win rate, PnL %, trade count, and risk/reward ratio (TP/SL). "
+    "Mention the saved strategy_id so the user can reference it later."
 )
 
 

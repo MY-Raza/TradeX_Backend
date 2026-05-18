@@ -1,68 +1,59 @@
 """
-TradeX – AI Orchestration Service  (v2 – Automatic Rolling Memory)
-==================================================================
+TradeX – AI Orchestration Service  (v3 – Strategy Generator Integration)
+=========================================================================
 
-WHAT CHANGED vs v1 (and WHY)
+WHAT CHANGED vs v2 (and WHY)
 ------------------------------
 
-ROOT CAUSE of "history too long" 503 error
--------------------------------------------
-The previous code raised HTTP 503 with a user-visible message asking them to
-manually delete their session when the ONE retry after a 413 also failed.
+STRATEGY GENERATOR INTEGRATION
+--------------------------------
+v3 makes strategy generation a first-class AI tool. Two new tools are wired
+into _dispatch_tool():
 
-That retry failed because:
-  1. The session STORE was never compressed between requests.  Even though
-     _call_groq_with_budget() trimmed the messages for one call, it never wrote
-     the trimmed version back to _SESSION_STORE.  So the next request started
-     with the same bloated history.
-  2. A single retry with tail=3 is not enough when the system prompt +
-     summary itself is large.
+  create_strategy
+    Delegates directly to strategy_generator_service.create_strategy().
+    Accepts the same parameters as POST /strategy-generator/create so the AI
+    can pass any combination of (name, symbol, exchange, timeframe, TP, SL,
+    leverage, fee, slippage, start/end dates).
 
-THE FIX (multi-layer defence)
-------------------------------
+  compare_strategies
+    A higher-level tool that loops create_strategy N times (2–5) and returns
+    a ranked summary.  Implemented here (not in strategy_generator_service) so
+    the AI never has to chain N parallel tool calls manually.  Results are
+    deduplicated and sorted by win_rate descending, then total_pnl_pct.
 
-Layer 1 – Proactive session compression (compress_session)
-  _append_message() now calls compress_session() after EVERY write.
-  If the session store exceeds SOFT_COMPRESSION_THRESHOLD (6 000 tokens),
-  old messages are summarised and replaced IN PLACE in _SESSION_STORE.
-  The user-visible history is stored SEPARATELY in _HISTORY_STORE and is
-  never compressed, so GET /ai/history always returns the full conversation.
+COMPRESSION EXTENSION
+----------------------
+Both new tools return large payloads (ledger + PnL + win-loss arrays).
+compress_tool_result() already handles "ledger", "pnl_data", and "win_loss_data"
+via _HEAVY_ARRAY_KEYS in token_budget.py.  We add those keys to the existing
+_HEAVY_ARRAY_KEYS frozenset (see token_budget.py patch note).  No new
+compression logic needed in ai_service.py itself.
 
-Layer 2 – Pre-flight token check (unchanged, improved)
-  _call_groq_with_budget() estimates tokens before every call and trims if
-  over TOKEN_BUDGET (7 500).  Because Layer 1 keeps the store lean, this is
-  now a safety net rather than the first line of defence.
-
-Layer 3 – 413 retry with emergency compression (improved)
-  On a 413 error we call emergency_compress() from token_budget.py which
-  builds the absolute minimum viable payload.  The compressed payload is
-  also written back to _SESSION_STORE so future calls benefit too.
-  We attempt up to 3 progressive retries with shrinking tail sizes.
-
-Layer 4 – Graceful final fallback
-  If all retries fail (essentially impossible with the above layers but
-  guarded anyway), we return a friendly AIChatResponse with an apology
-  instead of raising HTTP 503.  The user session is soft-reset so the next
-  message works normally.
-
-DUAL STORE ARCHITECTURE
-------------------------
-
-  _SESSION_STORE[sid]  – OpenAI-format messages for Groq API calls.
-                          Compressed automatically. Used only internally.
-
-  _HISTORY_STORE[sid]  – List[ChatMessage] for GET /ai/history responses.
-                          Never compressed. Append-only. User-facing.
-
-This separation means aggressive context compression never affects what the
-user sees in their chat history.
+_result_summary() is extended with cases for create_strategy and
+compare_strategies so the orchestration log and ToolExecution.result_summary
+are meaningful.
 
 NO BREAKING CHANGES
 --------------------
-- All tool dispatch logic is unchanged.
-- All schema types are unchanged.
+- All existing tool dispatch paths are UNCHANGED.
+- All schema types are unchanged (CreateStrategyResponse added to AIChatResponse.data).
 - GET /ai/history and DELETE /ai/history work identically.
 - AIChatResponse structure is unchanged.
+- Token budget / compression / retry logic is unchanged.
+
+TIMEOUT PROTECTION
+-------------------
+create_strategy runs OHLCV load + signals + backtest in asyncio.to_thread.
+For compare_strategies we run each strategy sequentially (not in parallel)
+to avoid saturating the thread-pool and to stay within DB connection limits.
+Each individual create_strategy call already has internal error handling;
+compare_strategies wraps each call in try/except and records partial failures.
+
+STRUCTURED LOGGING
+-------------------
+All new code paths use logger.info / logger.warning with structured key=value
+fields consistent with the existing service logging style.
 """
 
 from __future__ import annotations
@@ -96,9 +87,17 @@ from app.services import (
     model_service,
     sentiment_service,
     strategy_service,
+    # v3: import the strategy generator service so we can call it from
+    # _dispatch_tool() without touching its internal business logic.
+    strategy_generator_service,
 )
 from app.schemas.backtest_schema import BacktestRunRequest
 from app.schemas.sentiment_schema import SentimentRunRequest
+# v3: import the request schema for strategy generation
+from app.schemas.strategy_generator_schema import (
+    CreateStrategyRequest,
+    CreateStrategyResponse,
+)
 
 # v2: import updated token-budget utilities
 from app.models.token_budget import (
@@ -107,8 +106,8 @@ from app.models.token_budget import (
     EMERGENCY_TOKEN_BUDGET,
     build_summary_message,
     compress_tool_result,
-    compress_session,          # NEW – proactive session compression
-    emergency_compress,        # NEW – last-resort compression for retries
+    compress_session,          # NEW in v2 – proactive session compression
+    emergency_compress,        # NEW in v2 – last-resort compression for retries
     estimate_messages_tokens,
     trim_history,
 )
@@ -139,6 +138,14 @@ _GROQ_PAYLOAD_TOO_LARGE_CODES: frozenset[int] = frozenset({413, 400})
 
 # Maximum number of 413-retry attempts before giving up gracefully.
 _MAX_RETRIES: int = 3
+
+# v3: Safety cap on the number of strategies compare_strategies will generate.
+# Prevents abuse / accidental long-running requests.
+_MAX_COMPARE_COUNT: int = 5
+
+# v3: Per-strategy timeout guard for compare_strategies (seconds).
+# Each create_strategy call involves OHLCV load + backtest; 120 s is generous.
+_STRATEGY_GEN_TIMEOUT: float = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +265,7 @@ def delete_session(session_id: str) -> bool:
 
 
 # ===========================================================================
-# Token-aware Groq call with multi-stage 413 retry logic (v2)
+# Token-aware Groq call with multi-stage 413 retry logic (v2, unchanged in v3)
 # ===========================================================================
 
 async def _call_groq_with_budget(
@@ -455,7 +462,150 @@ def _soft_reset_session(session_id: str) -> None:
 
 
 # ===========================================================================
-# Tool dispatcher (UNCHANGED from v1)
+# v3: Strategy Generator helpers
+# ===========================================================================
+
+def _build_create_strategy_request(args: dict[str, Any]) -> CreateStrategyRequest:
+    """
+    Build a CreateStrategyRequest from AI tool call arguments.
+
+    WHY A SEPARATE HELPER: Keeps _dispatch_tool() readable and makes it easy
+    to add validation / default-filling in one place.  Also ensures every
+    optional field has a sensible default even when the AI omits it.
+    """
+    return CreateStrategyRequest(
+        name=args["name"],
+        symbol=args["symbol"].lower(),
+        exchange=args["exchange"].lower(),
+        timeframe=args["timeframe"].lower(),
+        start_date=args.get("start_date"),
+        end_date=args.get("end_date"),
+        starting_balance=float(args.get("starting_balance", 1000.0)),
+        take_profit=float(args.get("take_profit", 3.0)),
+        stop_loss=float(args.get("stop_loss", 1.0)),
+        fee=float(args.get("fee", 0.05)),
+        leverage=float(args.get("leverage", 1.0)),
+        slippage=float(args.get("slippage", 0.0)),
+    )
+
+
+async def _run_compare_strategies(
+    args: dict[str, Any],
+    db: AsyncSession,
+) -> dict[str, Any]:
+    """
+    Generate `count` strategies sequentially and return a ranked comparison dict.
+
+    WHY SEQUENTIAL (not asyncio.gather):
+    - Each strategy runs OHLCV load + backtest in asyncio.to_thread.
+    - Parallel execution would saturate the thread-pool and could exhaust DB
+      connections under load.
+    - Sequential is safer and still completes in reasonable time (30–90 s for 3).
+
+    WHY THIS RETURNS A PLAIN DICT (not CreateStrategyResponse):
+    - The AI tool result must be a single JSON-serialisable object.
+    - A list of CreateStrategyResponse plus a ranked summary is more useful
+      to the AI than a raw list.
+    - The UI receives the full structured dict via AIChatResponse.data.
+    """
+    count = max(2, min(int(args.get("count", 3)), _MAX_COMPARE_COUNT))
+    base_name = args.get("base_name", "Generated Strategy")
+    symbol = args["symbol"].lower()
+    exchange = args["exchange"].lower()
+    timeframe = args["timeframe"].lower()
+
+    logger.info(
+        "_run_compare_strategies | count=%d | symbol=%s | exchange=%s | timeframe=%s",
+        count, symbol, exchange, timeframe,
+    )
+
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for i in range(1, count + 1):
+        name = f"{base_name} #{i}"
+        req = CreateStrategyRequest(
+            name=name,
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=timeframe,
+            start_date=args.get("start_date"),
+            end_date=args.get("end_date"),
+            starting_balance=float(args.get("starting_balance", 1000.0)),
+            take_profit=float(args.get("take_profit", 3.0)),
+            stop_loss=float(args.get("stop_loss", 1.0)),
+            fee=float(args.get("fee", 0.05)),
+            leverage=float(args.get("leverage", 1.0)),
+            slippage=float(args.get("slippage", 0.0)),
+        )
+
+        try:
+            # Timeout protection: each individual strategy gen capped at
+            # _STRATEGY_GEN_TIMEOUT seconds to prevent a single slow run from
+            # blocking the entire compare operation.
+            resp: CreateStrategyResponse = await asyncio.wait_for(
+                strategy_generator_service.create_strategy(db, req),
+                timeout=_STRATEGY_GEN_TIMEOUT,
+            )
+            results.append({
+                "rank": None,               # filled after sorting
+                "strategy_id": resp.strategy_id,
+                "display_name": resp.display_name,
+                "timeframe": resp.timeframe,
+                "symbol": resp.symbol,
+                "exchange": resp.exchange,
+                "win_rate": resp.summary.win_rate,
+                "loss_rate": resp.summary.loss_rate,
+                "total_pnl_pct": resp.summary.total_pnl_pct,
+                "total_trades": resp.summary.total_trades,
+                "win_trades": resp.summary.win_trades,
+                "loss_trades": resp.summary.loss_trades,
+                "final_balance": resp.summary.final_balance,
+                "starting_balance": resp.summary.starting_balance,
+                "max_consecutive_wins": resp.summary.max_consecutive_wins,
+                "max_consecutive_losses": resp.summary.max_consecutive_losses,
+                "risk_reward_ratio": round(req.take_profit / req.stop_loss, 2),
+                "message": resp.message,
+            })
+            logger.info(
+                "_run_compare_strategies | strategy %d/%d done | id=%s | "
+                "win_rate=%.1f%% | pnl=%.2f%%",
+                i, count, resp.strategy_id,
+                resp.summary.win_rate, resp.summary.total_pnl_pct,
+            )
+        except asyncio.TimeoutError:
+            msg = f"Strategy '{name}' timed out after {_STRATEGY_GEN_TIMEOUT:.0f}s"
+            errors.append(msg)
+            logger.warning("_run_compare_strategies | %s", msg)
+        except HTTPException as http_exc:
+            msg = f"Strategy '{name}' failed: {http_exc.detail}"
+            errors.append(msg)
+            logger.warning("_run_compare_strategies | %s", msg)
+        except Exception as exc:
+            msg = f"Strategy '{name}' error: {exc}"
+            errors.append(msg)
+            logger.error("_run_compare_strategies | %s", msg, exc_info=True)
+
+    # Sort by win_rate DESC, then total_pnl_pct DESC
+    results.sort(key=lambda r: (-r["win_rate"], -r["total_pnl_pct"]))
+
+    # Assign rank
+    for rank, r in enumerate(results, start=1):
+        r["rank"] = rank
+
+    return {
+        "generated": len(results),
+        "requested": count,
+        "errors": errors,
+        "ranked_strategies": results,
+        "best_strategy_id": results[0]["strategy_id"] if results else None,
+        "best_win_rate": results[0]["win_rate"] if results else None,
+        "best_pnl_pct": results[0]["total_pnl_pct"] if results else None,
+    }
+
+
+# ===========================================================================
+# Tool dispatcher (v3: extended with create_strategy and compare_strategies)
 # ===========================================================================
 
 async def _dispatch_tool(
@@ -465,7 +615,12 @@ async def _dispatch_tool(
 ) -> Any:
     """
     Route a tool call to the correct backend service function.
-    Business logic is UNCHANGED from the original implementation.
+
+    v3 ADDITIONS (at the bottom, before the final raise):
+      create_strategy      → strategy_generator_service.create_strategy()
+      compare_strategies   → _run_compare_strategies() (defined above)
+
+    All existing routing paths are UNCHANGED.
     """
 
     # ── Strategies ─────────────────────────────────────────────────────────
@@ -562,6 +717,71 @@ async def _dispatch_tool(
             end_date=args.get("end_date"),
         )
 
+    # =======================================================================
+    # v3: STRATEGY GENERATOR TOOLS
+    # =======================================================================
+
+    # ── Create / generate a single strategy ────────────────────────────────
+    if tool_name == "create_strategy":
+        # Validate required fields before hitting the service layer so we get
+        # a clear error message from the AI rather than a Pydantic ValidationError.
+        for required_field in ("name", "symbol", "exchange", "timeframe"):
+            if not args.get(required_field):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"create_strategy requires '{required_field}'. "
+                        "Please provide it and try again."
+                    ),
+                )
+
+        req = _build_create_strategy_request(args)
+
+        logger.info(
+            "_dispatch_tool | create_strategy | name=%s | symbol=%s | "
+            "exchange=%s | timeframe=%s | tp=%.1f | sl=%.1f | leverage=%.1f",
+            req.name, req.symbol, req.exchange, req.timeframe,
+            req.take_profit, req.stop_loss, req.leverage,
+        )
+
+        # strategy_generator_service.create_strategy() already:
+        #   - validates timeframe and exchange (raises HTTPException on failure)
+        #   - runs OHLCV load + resample + signals + backtest in asyncio.to_thread
+        #   - persists signal table, strategy registry, and backtest run
+        #   - returns CreateStrategyResponse with full ledger + summary
+        # We call it directly without wrapping to preserve all existing error
+        # handling.  HTTPException propagates naturally to _dispatch_tool's
+        # caller in process_chat().
+        return await strategy_generator_service.create_strategy(db, req)
+
+    # ── Compare N generated strategies ─────────────────────────────────────
+    if tool_name == "compare_strategies":
+        # Validate required fields
+        for required_field in ("symbol", "exchange", "timeframe"):
+            if not args.get(required_field):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"compare_strategies requires '{required_field}'. "
+                        "Please provide it and try again."
+                    ),
+                )
+
+        count = int(args.get("count", 3))
+        if not (2 <= count <= _MAX_COMPARE_COUNT):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"compare_strategies count must be 2–{_MAX_COMPARE_COUNT}. Got {count}.",
+            )
+
+        logger.info(
+            "_dispatch_tool | compare_strategies | count=%d | symbol=%s | "
+            "exchange=%s | timeframe=%s",
+            count, args["symbol"], args["exchange"], args["timeframe"],
+        )
+
+        return await _run_compare_strategies(args, db)
+
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=f"Unknown tool '{tool_name}' requested by AI.",
@@ -569,7 +789,7 @@ async def _dispatch_tool(
 
 
 # ===========================================================================
-# Result serialisation helpers (UNCHANGED from v1)
+# Result serialisation helpers (extended in v3 for strategy generator types)
 # ===========================================================================
 
 def _serialise_result(result: Any) -> dict[str, Any]:
@@ -586,6 +806,9 @@ def _serialise_result(result: Any) -> dict[str, Any]:
             ],
             "count": len(result),
         }
+    # v3: compare_strategies already returns a plain dict
+    if isinstance(result, dict):
+        return result
     return {"value": result}
 
 
@@ -638,13 +861,40 @@ def _result_summary(tool_name: str, result: Any) -> str:
                 f"{result.total_rows} candles, "
                 f"last close ${result.close:.4f}"
             )
+
+        # ── v3: strategy generator summaries ──────────────────────────────
+        if tool_name == "create_strategy":
+            # result is a CreateStrategyResponse (has .summary, .strategy_id)
+            s = result.summary
+            return (
+                f"Strategy '{result.strategy_id}' created: "
+                f"{s.total_trades} trades, "
+                f"win rate {s.win_rate:.1f}%, "
+                f"PnL {s.total_pnl_pct:+.2f}%, "
+                f"final balance ${s.final_balance:.2f}"
+            )
+
+        if tool_name == "compare_strategies":
+            # result is the plain dict from _run_compare_strategies()
+            generated = result.get("generated", 0)
+            best_id = result.get("best_strategy_id", "N/A")
+            best_wr = result.get("best_win_rate")
+            best_pnl = result.get("best_pnl_pct")
+            best_wr_str = f"{best_wr:.1f}%" if best_wr is not None else "N/A"
+            best_pnl_str = f"{best_pnl:+.2f}%" if best_pnl is not None else "N/A"
+            return (
+                f"Compared {generated} strategies; "
+                f"best: {best_id} "
+                f"(win rate {best_wr_str}, PnL {best_pnl_str})"
+            )
+
     except Exception:
         pass
     return f"Tool '{tool_name}' executed successfully"
 
 
 # ===========================================================================
-# Main orchestration entry-point
+# Main orchestration entry-point (UNCHANGED from v2 except import additions)
 # ===========================================================================
 
 async def process_chat(
@@ -670,14 +920,13 @@ async def process_chat(
     6.  When the model returns a plain text reply, append to both stores
         and return AIChatResponse.
 
-    KEY v2 CHANGES vs v1
+    KEY v3 CHANGES vs v2
     ---------------------
-    - User-visible history stored in _HISTORY_STORE (separate, never compressed).
-    - _append_message() triggers compress_session() automatically.
-    - _call_groq_with_budget() has 3-retry progressive fallback, not 1-retry.
-    - _FALLBACK_SENTINEL handling: no HTTP 503 ever raised to the user.
-    - _soft_reset_session() used as last resort to clear API context without
-      deleting the user's conversation history.
+    - create_strategy and compare_strategies routed in _dispatch_tool().
+    - _result_summary() extended for new tool names.
+    - _serialise_result() extended for plain dict (compare_strategies result).
+    - SYSTEM_PROMPT updated with strategy generation routing rules.
+    - No changes to the orchestration loop itself.
     """
     sid = _get_or_create_session(session_id)
 
@@ -780,7 +1029,7 @@ async def process_chat(
                 last_structured_data = serialised
 
                 # Compressed result → session history (saves ~60-90% tokens
-                # on backtest / sentiment payloads)
+                # on backtest / sentiment / strategy-gen payloads)
                 compressed = compress_tool_result(tool_name, serialised)
                 compressed_json = json.dumps(compressed, default=str)
                 original_json = json.dumps(serialised, default=str)
