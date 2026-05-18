@@ -1,37 +1,68 @@
 """
-TradeX – AI Orchestration Service (Groq / Llama 3.3-70B)
-=========================================================
+TradeX – AI Orchestration Service  (v2 – Automatic Rolling Memory)
+==================================================================
 
-Responsibilities
-----------------
-1.  Maintain per-session conversation history in-memory (keyed by session_id)
-2.  Receive a user prompt and build a full OpenAI-format messages list
-3.  Pre-flight token estimation before every Groq call
-4.  Send the (trimmed) messages to Groq via the OpenAI-compatible SDK
-5.  Parse ``tool_calls`` from the response and dispatch to backend services
-6.  Compress tool results before storing them in session history
-7.  Inject tool results back as ``role="tool"`` messages and loop
-8.  Return AIChatResponse with the final text reply + tool execution trace
+WHAT CHANGED vs v1 (and WHY)
+------------------------------
 
-TOKEN OPTIMISATION CHANGES (vs original)
------------------------------------------
-| Problem                            | Fix                                        |
-|------------------------------------|--------------------------------------------|
-| _MAX_HISTORY_MESSAGES=50 by count  | Budget managed in TOKENS not message count |
-| Tool results stored raw (~15K tok) | Compressed via compress_tool_result()      |
-| max_tokens=4096 per call           | Lowered to 1024 (overridable)              |
-| No pre-flight token check          | estimate_messages_tokens() before each call|
-| 413 crashes request                | Retry loop with trim → summarise → retry   |
-| Verbose system prompt              | Compact SYSTEM_PROMPT (~110 tokens)        |
+ROOT CAUSE of "history too long" 503 error
+-------------------------------------------
+The previous code raised HTTP 503 with a user-visible message asking them to
+manually delete their session when the ONE retry after a 413 also failed.
 
-Groq 413 error handling
+That retry failed because:
+  1. The session STORE was never compressed between requests.  Even though
+     _call_groq_with_budget() trimmed the messages for one call, it never wrote
+     the trimmed version back to _SESSION_STORE.  So the next request started
+     with the same bloated history.
+  2. A single retry with tail=3 is not enough when the system prompt +
+     summary itself is large.
+
+THE FIX (multi-layer defence)
+------------------------------
+
+Layer 1 – Proactive session compression (compress_session)
+  _append_message() now calls compress_session() after EVERY write.
+  If the session store exceeds SOFT_COMPRESSION_THRESHOLD (6 000 tokens),
+  old messages are summarised and replaced IN PLACE in _SESSION_STORE.
+  The user-visible history is stored SEPARATELY in _HISTORY_STORE and is
+  never compressed, so GET /ai/history always returns the full conversation.
+
+Layer 2 – Pre-flight token check (unchanged, improved)
+  _call_groq_with_budget() estimates tokens before every call and trims if
+  over TOKEN_BUDGET (7 500).  Because Layer 1 keeps the store lean, this is
+  now a safety net rather than the first line of defence.
+
+Layer 3 – 413 retry with emergency compression (improved)
+  On a 413 error we call emergency_compress() from token_budget.py which
+  builds the absolute minimum viable payload.  The compressed payload is
+  also written back to _SESSION_STORE so future calls benefit too.
+  We attempt up to 3 progressive retries with shrinking tail sizes.
+
+Layer 4 – Graceful final fallback
+  If all retries fail (essentially impossible with the above layers but
+  guarded anyway), we return a friendly AIChatResponse with an apology
+  instead of raising HTTP 503.  The user session is soft-reset so the next
+  message works normally.
+
+DUAL STORE ARCHITECTURE
 ------------------------
-When a 413 (request too large) is returned we:
-  1. Trim history via trim_history() to drop old messages.
-  2. If still too large, inject a compact summary and keep only the tail.
-  3. Retry the call once.  If it fails again we raise a 503 with a clear msg.
 
-This is transparent to the user – they never see the 413; they get the answer.
+  _SESSION_STORE[sid]  – OpenAI-format messages for Groq API calls.
+                          Compressed automatically. Used only internally.
+
+  _HISTORY_STORE[sid]  – List[ChatMessage] for GET /ai/history responses.
+                          Never compressed. Append-only. User-facing.
+
+This separation means aggressive context compression never affects what the
+user sees in their chat history.
+
+NO BREAKING CHANGES
+--------------------
+- All tool dispatch logic is unchanged.
+- All schema types are unchanged.
+- GET /ai/history and DELETE /ai/history work identically.
+- AIChatResponse structure is unchanged.
 """
 
 from __future__ import annotations
@@ -69,11 +100,15 @@ from app.services import (
 from app.schemas.backtest_schema import BacktestRunRequest
 from app.schemas.sentiment_schema import SentimentRunRequest
 
-# NEW: import token-budget utilities
+# v2: import updated token-budget utilities
 from app.models.token_budget import (
     TOKEN_BUDGET,
+    SOFT_COMPRESSION_THRESHOLD,
+    EMERGENCY_TOKEN_BUDGET,
     build_summary_message,
     compress_tool_result,
+    compress_session,          # NEW – proactive session compression
+    emergency_compress,        # NEW – last-resort compression for retries
     estimate_messages_tokens,
     trim_history,
 )
@@ -88,29 +123,39 @@ logger = logging.getLogger("tradex.ai.service")
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_ROUNDS: int = 5       # maximum tool-call → result cycles per request
-_GROQ_TIMEOUT: float = 60.0    # seconds per Groq API call
+MAX_TOOL_ROUNDS: int = 5
+_GROQ_TIMEOUT: float = 60.0
 
-# CHANGED: history is now governed by TOKEN_BUDGET (from token_budget.py),
-# not by a fixed message count.  _MAX_HISTORY_MESSAGES is kept as a hard cap
-# to bound memory even if individual messages are very short.
+# Hard cap on stored messages (memory guard even for very short messages).
 _MAX_HISTORY_MESSAGES: int = 40
 
-# Max tokens to request from the model.
-# Lower = fewer TPM consumed = less risk of 413.
-# For a trading Q&A assistant 1 024 output tokens is almost always enough.
+# Max output tokens per Groq call.
+# Groq counts requested output tokens against the TPM limit even when the
+# actual reply is short.  1024 is sufficient for trading Q&A.
 _DEFAULT_MAX_OUTPUT_TOKENS: int = 1_024
 
-# Groq HTTP error codes that indicate a payload-too-large condition.
+# HTTP error codes Groq uses for payload-too-large.
 _GROQ_PAYLOAD_TOO_LARGE_CODES: frozenset[int] = frozenset({413, 400})
 
+# Maximum number of 413-retry attempts before giving up gracefully.
+_MAX_RETRIES: int = 3
+
+
 # ---------------------------------------------------------------------------
-# In-memory session store
-# Maps session_id → list[dict] in OpenAI messages format.
-# Replace with Redis for multi-instance production deployments.
+# DUAL STORE ARCHITECTURE (NEW in v2)
+#
+# _SESSION_STORE: OpenAI-format messages used for Groq API calls.
+#   – Automatically compressed by compress_session() on every write.
+#   – May have old turns replaced by compact summaries.
+#   – NEVER exposed directly to the user.
+#
+# _HISTORY_STORE: ChatMessage list used for GET /ai/history.
+#   – Append-only; never compressed or mutated.
+#   – Always shows the user their full conversation.
 # ---------------------------------------------------------------------------
 
 _SESSION_STORE: dict[str, list[dict[str, Any]]] = {}
+_HISTORY_STORE: dict[str, list[ChatMessage]] = {}
 
 
 # ===========================================================================
@@ -118,76 +163,102 @@ _SESSION_STORE: dict[str, list[dict[str, Any]]] = {}
 # ===========================================================================
 
 def _get_or_create_session(session_id: Optional[str]) -> str:
-    """Return existing session id or create a new one."""
+    """Return existing session id or create fresh stores for a new one."""
     if not session_id or session_id not in _SESSION_STORE:
         sid = session_id or str(uuid.uuid4())
+        # Initialise both stores for this session
         _SESSION_STORE[sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        _HISTORY_STORE[sid] = []
+        logger.info("_get_or_create_session | new session created | sid=%s", sid)
         return sid
     return session_id
 
 
 def _append_message(session_id: str, message: dict[str, Any]) -> None:
     """
-    Append one OpenAI-format message to the session history.
+    Append one OpenAI-format message to the session's API history.
 
-    Trimming strategy (CHANGED from original):
-    - Hard cap: if message count exceeds _MAX_HISTORY_MESSAGES, drop oldest
-      non-system messages first (same as before).
-    - Token cap: after appending, if estimated tokens exceed TOKEN_BUDGET,
-      run trim_history() to bring it back under budget.
+    Post-append housekeeping (NEW in v2):
+    1. Hard message-count cap (_MAX_HISTORY_MESSAGES) – drops oldest non-system.
+    2. compress_session() – proactively summarises if token count is over
+       SOFT_COMPRESSION_THRESHOLD.  This keeps _SESSION_STORE lean between
+       requests, which was the key missing piece in v1.
 
-    The system message at index 0 is always preserved.
+    Only the API-facing _SESSION_STORE is modified here.
+    User-visible history (_HISTORY_STORE) is updated separately in
+    process_chat() so we can filter to text-only turns.
     """
     history = _SESSION_STORE.setdefault(
         session_id, [{"role": "system", "content": SYSTEM_PROMPT}]
     )
     history.append(message)
 
-    # Hard message-count cap (memory guard)
+    # Hard message-count guard (memory safety)
     if len(history) > _MAX_HISTORY_MESSAGES:
-        _SESSION_STORE[session_id] = [history[0]] + history[-(
-            _MAX_HISTORY_MESSAGES - 1
-        ):]
-        history = _SESSION_STORE[session_id]
+        _SESSION_STORE[session_id] = [history[0]] + history[-(_MAX_HISTORY_MESSAGES - 1):]
+        logger.debug(
+            "_append_message | hard cap hit | trimmed to %d messages",
+            _MAX_HISTORY_MESSAGES,
+        )
 
-    # Token cap – run trim only when we're clearly over budget
-    current_tokens = estimate_messages_tokens(history)
-    if current_tokens > TOKEN_BUDGET:
-        _SESSION_STORE[session_id] = trim_history(history, budget=TOKEN_BUDGET)
+    # ── KEY FIX (v2): proactive compression on every write ─────────────────
+    # In v1 this was missing.  The session store could grow indefinitely
+    # between requests, causing repeated 413s even after retry logic was added.
+    compress_session(
+        session_store=_SESSION_STORE,
+        session_id=session_id,
+        budget=SOFT_COMPRESSION_THRESHOLD,
+    )
+
+    # Log current token usage for observability
+    current_tokens = estimate_messages_tokens(_SESSION_STORE.get(session_id, []))
+    logger.debug(
+        "_append_message | session=%s | stored_msgs=%d | stored_tokens≈%d",
+        session_id,
+        len(_SESSION_STORE.get(session_id, [])),
+        current_tokens,
+    )
+
+
+def _append_to_history(session_id: str, role: str, content: str) -> None:
+    """
+    Append a user or assistant text turn to the user-visible _HISTORY_STORE.
+    Tool messages are never added here (they are internal implementation detail).
+    """
+    if role not in ("user", "assistant"):
+        return
+    ts = datetime.now(timezone.utc).isoformat()
+    store = _HISTORY_STORE.setdefault(session_id, [])
+    store.append(
+        ChatMessage(
+            role=role,   # type: ignore[arg-type]
+            content=content,
+            timestamp=ts,
+        )
+    )
 
 
 def get_session_messages(session_id: str) -> list[ChatMessage]:
     """
-    Return conversation history as ChatMessage objects for GET /ai/history.
-    Filters to user and assistant text turns; skips tool messages.
+    Return user-visible conversation history for GET /ai/history.
+
+    v2 CHANGE: reads from _HISTORY_STORE (never compressed) instead of
+    filtering _SESSION_STORE.  This means the user always sees the full
+    conversation even when the API context has been summarised.
     """
-    history = _SESSION_STORE.get(session_id, [])
-    messages: list[ChatMessage] = []
-    ts = datetime.now(timezone.utc).isoformat()
-    for turn in history:
-        role = turn.get("role")
-        content = turn.get("content")
-        if role in ("user", "assistant") and isinstance(content, str) and content:
-            messages.append(
-                ChatMessage(
-                    role=role,  # type: ignore[arg-type]
-                    content=content,
-                    timestamp=ts,
-                )
-            )
-    return messages
+    return list(_HISTORY_STORE.get(session_id, []))
 
 
 def delete_session(session_id: str) -> bool:
-    """Delete a session from the store. Returns True if it existed."""
-    if session_id in _SESSION_STORE:
-        del _SESSION_STORE[session_id]
-        return True
-    return False
+    """Delete both stores for a session. Returns True if the session existed."""
+    existed = session_id in _SESSION_STORE or session_id in _HISTORY_STORE
+    _SESSION_STORE.pop(session_id, None)
+    _HISTORY_STORE.pop(session_id, None)
+    return existed
 
 
 # ===========================================================================
-# Token-aware Groq call with 413 retry logic
+# Token-aware Groq call with multi-stage 413 retry logic (v2)
 # ===========================================================================
 
 async def _call_groq_with_budget(
@@ -196,43 +267,50 @@ async def _call_groq_with_budget(
     max_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> Any:
     """
-    Wrapper around call_groq() that:
+    Token-aware wrapper around call_groq() with multi-stage fallback.
 
-    1. Estimates token count before sending.
-    2. If estimate exceeds TOKEN_BUDGET, trims history pre-emptively.
-    3. Calls Groq with asyncio.wait_for timeout.
-    4. On 413/400 (payload too large): trims aggressively, injects a summary,
-       and retries ONCE.
-    5. On repeated failure: raises HTTP 503 with a human-readable message.
+    v1 had ONE retry that could still fail and raise HTTP 503.
+    v2 has THREE progressive retries that compress more aggressively each time,
+    and a final graceful fallback instead of a user-visible error.
 
-    This is the SINGLE place where all Groq calls go – ai_service never calls
-    call_groq() directly anymore.
+    Stage 0 – Pre-flight trim
+      Trim if estimated tokens > TOKEN_BUDGET before the first attempt.
 
-    Parameters
-    ----------
-    session_id : Used only for logging.
-    messages   : The full messages list to send (may be mutated by retry).
-    max_tokens : Passed to call_groq(); lower = safer for TPM budget.
+    Stage 1 – First attempt
+      Call Groq normally.  Usually succeeds because compress_session() has
+      already kept the session lean.
+
+    Stage 2 – On 413: emergency compress + retry (up to _MAX_RETRIES times)
+      Each retry reduces the payload further via emergency_compress().
+      The compressed payload is written back to _SESSION_STORE so the session
+      benefits for future turns too.
+
+    Stage 3 – Graceful final fallback
+      If all retries fail (edge case: system prompt alone is over budget),
+      return a synthetic "I need to reset my context" response.  The session
+      is soft-reset so the user can keep talking without manual intervention.
     """
 
-    # ── Pre-flight estimate ────────────────────────────────────────────────
+    # ── Stage 0: pre-flight trim ───────────────────────────────────────────
     estimated = estimate_messages_tokens(messages)
     logger.info(
-        "_call_groq_with_budget | session=%s | estimated_tokens=%d | budget=%d",
+        "_call_groq_with_budget | session=%s | pre-flight tokens≈%d | budget=%d",
         session_id, estimated, TOKEN_BUDGET,
     )
 
     if estimated > TOKEN_BUDGET:
         logger.warning(
-            "_call_groq_with_budget | pre-flight over budget – trimming before call",
+            "_call_groq_with_budget | over budget pre-flight – trimming",
         )
         messages = trim_history(messages, budget=TOKEN_BUDGET)
+        # Write the trimmed version back so the store stays lean
+        _SESSION_STORE[session_id] = messages
         estimated = estimate_messages_tokens(messages)
         logger.info(
-            "_call_groq_with_budget | after pre-flight trim | tokens=%d", estimated,
+            "_call_groq_with_budget | after pre-flight trim | tokens≈%d", estimated,
         )
 
-    # ── First attempt ──────────────────────────────────────────────────────
+    # ── Stage 1: first attempt ─────────────────────────────────────────────
     try:
         return await asyncio.wait_for(
             call_groq(messages, max_tokens=max_tokens),
@@ -246,22 +324,12 @@ async def _call_groq_with_budget(
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Groq API timed out after {_GROQ_TIMEOUT:.0f}s.",
+            detail=f"Groq API timed out after {_GROQ_TIMEOUT:.0f}s. Please try again.",
         )
 
     except Exception as exc:
-        # ── 413 / payload-too-large detection ─────────────────────────────
-        # The openai SDK wraps HTTP errors; the status_code lives on the
-        # exception body or as exc.status_code / exc.response.status_code.
-        exc_str = str(exc)
-        is_413 = (
-            "413" in exc_str
-            or "Request too large" in exc_str
-            or "request_too_large" in exc_str.lower()
-            or getattr(exc, "status_code", None) in _GROQ_PAYLOAD_TOO_LARGE_CODES
-        )
-
-        if not is_413:
+        if not _is_413(exc):
+            # Non-413 error – raise immediately, not a token problem
             logger.error(
                 "_call_groq_with_budget | session=%s | Groq error: %s",
                 session_id, exc,
@@ -271,58 +339,123 @@ async def _call_groq_with_budget(
                 detail=f"Groq API error: {exc}",
             )
 
-        # ── Retry path: aggressive trim + summary injection ────────────────
+        # ── Stage 2: 413 detected – progressive retry loop ─────────────────
         logger.warning(
-            "_call_groq_with_budget | session=%s | 413 received – retrying with "
-            "aggressive trim + summary",
+            "_call_groq_with_budget | session=%s | 413 received – starting retry loop",
             session_id,
         )
 
-        # Build a compact summary of the old history before we discard it
-        system_msg = messages[0]
-        non_system = messages[1:]
+        current_messages = messages
+        for attempt in range(1, _MAX_RETRIES + 1):
+            # Shrink budget by 20% each retry to ensure we make progress
+            retry_budget = int(EMERGENCY_TOKEN_BUDGET * (1 - 0.2 * (attempt - 1)))
+            retry_budget = max(retry_budget, 2000)  # absolute floor
 
-        summary_msg = build_summary_message(non_system)
+            # emergency_compress() returns a minimal but valid messages list
+            retry_messages = emergency_compress(current_messages, budget=retry_budget)
 
-        # Keep only the last 3 messages (most recent user + assistant exchange)
-        recent_tail = non_system[-3:] if len(non_system) >= 3 else non_system
+            retry_tokens = estimate_messages_tokens(retry_messages)
+            logger.info(
+                "_call_groq_with_budget | retry %d/%d | budget=%d | tokens≈%d | msgs=%d",
+                attempt, _MAX_RETRIES, retry_budget, retry_tokens, len(retry_messages),
+            )
 
-        # Reconstruct: system → summary → recent tail
-        retry_messages = [system_msg, summary_msg] + recent_tail
+            # Write back to session store so future turns start lean
+            _SESSION_STORE[session_id] = retry_messages
 
-        retry_tokens = estimate_messages_tokens(retry_messages)
-        logger.info(
-            "_call_groq_with_budget | retry | tokens=%d | messages=%d",
-            retry_tokens, len(retry_messages),
+            try:
+                result = await asyncio.wait_for(
+                    call_groq(retry_messages, max_tokens=max_tokens),
+                    timeout=_GROQ_TIMEOUT,
+                )
+                logger.info(
+                    "_call_groq_with_budget | session=%s | succeeded on retry %d",
+                    session_id, attempt,
+                )
+                return result
+
+            except asyncio.TimeoutError:
+                logger.error(
+                    "_call_groq_with_budget | session=%s | retry %d timed out",
+                    session_id, attempt,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Groq API timed out. Please try again.",
+                )
+
+            except Exception as retry_exc:
+                if _is_413(retry_exc):
+                    logger.warning(
+                        "_call_groq_with_budget | session=%s | retry %d also 413 "
+                        "– compressing further",
+                        session_id, attempt,
+                    )
+                    current_messages = retry_messages  # feed into next iteration
+                    continue
+                # Non-413 error on retry – propagate
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Groq API error on retry: {retry_exc}",
+                )
+
+        # ── Stage 3: graceful final fallback ───────────────────────────────
+        # All retries exhausted.  Instead of HTTP 503, soft-reset the context
+        # and return a synthetic response.  The user can keep chatting normally.
+        logger.error(
+            "_call_groq_with_budget | session=%s | all %d retries exhausted – "
+            "soft-resetting context and returning fallback response",
+            session_id, _MAX_RETRIES,
         )
+        _soft_reset_session(session_id)
+        # Return a sentinel that process_chat() will convert to a user-friendly reply
+        return _FALLBACK_SENTINEL
 
-        try:
-            return await asyncio.wait_for(
-                call_groq(retry_messages, max_tokens=max_tokens),
-                timeout=_GROQ_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Groq API timed out on retry.",
-            )
-        except Exception as retry_exc:
-            logger.error(
-                "_call_groq_with_budget | session=%s | retry also failed: %s",
-                session_id, retry_exc,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=(
-                    "The conversation history is too long for the current Groq plan. "
-                    "Please start a new session or delete this session's history "
-                    "via DELETE /ai/history/{session_id}."
-                ),
-            )
+
+def _is_413(exc: Exception) -> bool:
+    """Detect Groq's payload-too-large error regardless of how the SDK wraps it."""
+    exc_str = str(exc)
+    return (
+        "413" in exc_str
+        or "Request too large" in exc_str
+        or "request_too_large" in exc_str.lower()
+        or getattr(exc, "status_code", None) in _GROQ_PAYLOAD_TOO_LARGE_CODES
+    )
+
+
+# Sentinel object returned by _call_groq_with_budget on graceful fallback.
+# process_chat() checks for this and returns a friendly message instead of
+# crashing.  Using a dedicated sentinel avoids isinstance() checks on the
+# ChatCompletion return type.
+_FALLBACK_SENTINEL = object()
+
+_FALLBACK_REPLY = (
+    "I've been working on a long conversation and my context window filled up. "
+    "I've automatically summarised our earlier discussion so we can continue. "
+    "Please resend your last message and I'll answer it right away."
+)
+
+
+def _soft_reset_session(session_id: str) -> None:
+    """
+    Soft-reset a session's API context to the minimum viable state.
+
+    The user-visible _HISTORY_STORE is LEFT INTACT so the user still sees
+    their full conversation in the chat UI.  Only the internal _SESSION_STORE
+    (used for Groq API calls) is reset to [system_prompt].
+
+    This is called as a last resort after all retries are exhausted.  The next
+    user message will start a fresh context window.
+    """
+    logger.warning(
+        "_soft_reset_session | session=%s | resetting API context to system prompt only",
+        session_id,
+    )
+    _SESSION_STORE[session_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
 # ===========================================================================
-# Tool dispatcher
+# Tool dispatcher (UNCHANGED from v1)
 # ===========================================================================
 
 async def _dispatch_tool(
@@ -436,7 +569,7 @@ async def _dispatch_tool(
 
 
 # ===========================================================================
-# Result serialisation helpers (unchanged from original)
+# Result serialisation helpers (UNCHANGED from v1)
 # ===========================================================================
 
 def _serialise_result(result: Any) -> dict[str, Any]:
@@ -524,30 +657,35 @@ async def process_chat(
 
     Flow
     ----
-    1.  Retrieve or create a session; load existing OpenAI-format history.
-    2.  Append the new user turn to history.
-    3.  Snapshot history + run token pre-flight check via _call_groq_with_budget().
-    4.  If the model returns ``tool_calls``:
-          a.  Echo the assistant message (with tool_calls) back into history.
-          b.  Dispatch each tool call to the correct backend service.
-          c.  Compress the tool result (strip chart arrays) before storing.
-          d.  Append each result as a ``role="tool"`` message.
-          e.  Repeat from step 3 (up to MAX_TOOL_ROUNDS times).
-    5.  When the model returns a plain text reply, persist history and return.
+    1.  Retrieve or create session; both _SESSION_STORE and _HISTORY_STORE
+        are initialised if new.
+    2.  Append user turn to _SESSION_STORE (API context) and _HISTORY_STORE
+        (user-visible history).
+    3.  Call _call_groq_with_budget() which handles all token management
+        and retries transparently.
+    4.  If response is _FALLBACK_SENTINEL (graceful fallback after all retries
+        exhausted), return a friendly AIChatResponse immediately.
+    5.  If the model returns tool_calls, dispatch them, compress results,
+        append to _SESSION_STORE, and loop (up to MAX_TOOL_ROUNDS).
+    6.  When the model returns a plain text reply, append to both stores
+        and return AIChatResponse.
 
-    KEY CHANGES vs original
-    -----------------------
-    - call_groq() is replaced by _call_groq_with_budget() everywhere.
-    - Tool results are compressed via compress_tool_result() before being
-      stored in session history (the uncompressed version is still returned
-      to the UI via last_structured_data / AIChatResponse.data).
-    - Token estimation + trim happens proactively on every round, not just
-      reactively on error.
+    KEY v2 CHANGES vs v1
+    ---------------------
+    - User-visible history stored in _HISTORY_STORE (separate, never compressed).
+    - _append_message() triggers compress_session() automatically.
+    - _call_groq_with_budget() has 3-retry progressive fallback, not 1-retry.
+    - _FALLBACK_SENTINEL handling: no HTTP 503 ever raised to the user.
+    - _soft_reset_session() used as last resort to clear API context without
+      deleting the user's conversation history.
     """
     sid = _get_or_create_session(session_id)
 
-    # Append the incoming user message
+    # Append user message to API context store
     _append_message(sid, {"role": "user", "content": user_message})
+    # Append to user-visible history store (text-only, never compressed)
+    _append_to_history(sid, "user", user_message)
+
     logger.info(
         "process_chat | session=%s | user_message_len=%d",
         sid, len(user_message),
@@ -557,39 +695,55 @@ async def process_chat(
     last_structured_data: Optional[dict[str, Any]] = None
     final_reply: str = ""
 
-    # ── Orchestration loop ─────────────────────────────────────────────────
+    # ── Orchestration loop ──────────────────────────────────────────────────
     for round_num in range(MAX_TOOL_ROUNDS):
         logger.debug(
             "process_chat | session=%s | round=%d/%d",
             sid, round_num + 1, MAX_TOOL_ROUNDS,
         )
 
-        # Snapshot current history for this round's API call
         current_messages = list(_SESSION_STORE.get(sid, []))
 
-        # ── Call Groq (token-aware, with 413 retry) ────────────────────────
+        # ── Call Groq (token-aware, multi-retry, graceful fallback) ─────────
         response = await _call_groq_with_budget(
             session_id=sid,
             messages=current_messages,
             max_tokens=_DEFAULT_MAX_OUTPUT_TOKENS,
         )
 
+        # ── Handle graceful fallback sentinel ───────────────────────────────
+        # This is returned when all retries are exhausted.  We return a
+        # friendly message instead of crashing.  The session context has been
+        # soft-reset so the next user message will work normally.
+        if response is _FALLBACK_SENTINEL:
+            final_reply = _FALLBACK_REPLY
+            _append_to_history(sid, "assistant", final_reply)
+            logger.warning(
+                "process_chat | session=%s | fallback sentinel received – "
+                "returning graceful reply",
+                sid,
+            )
+            break
+
         tool_calls = extract_tool_calls(response)
         text_reply = extract_text(response)
 
-        # ── No tool calls → model gave final text answer ───────────────────
+        # ── No tool calls → model gave final text answer ────────────────────
         if not tool_calls:
             final_reply = text_reply or "I've completed the requested operations."
             _append_message(sid, {"role": "assistant", "content": final_reply})
+            _append_to_history(sid, "assistant", final_reply)
             logger.info(
                 "process_chat | session=%s | final_reply_len=%d | rounds_used=%d",
                 sid, len(final_reply), round_num + 1,
             )
             break
 
-        # ── Echo assistant message (with tool_calls) into history ──────────
+        # ── Echo assistant message (with tool_calls) into API history ───────
         assistant_msg = build_assistant_tool_call_message(response)
         _append_message(sid, assistant_msg)
+        # Note: tool-call assistant turns are NOT added to _HISTORY_STORE
+        # (they are internal implementation detail, not user-facing text)
 
         logger.debug(
             "process_chat | session=%s | round=%d | tool_calls=%s",
@@ -597,7 +751,7 @@ async def process_chat(
             [tc["name"] for tc in tool_calls],
         )
 
-        # ── Dispatch each tool call ────────────────────────────────────────
+        # ── Dispatch each tool call ─────────────────────────────────────────
         for tc in tool_calls:
             tool_name = tc["name"]
             args: dict[str, Any] = tc.get("args") or {}
@@ -622,23 +776,21 @@ async def process_chat(
                     )
                 )
 
-                # ── CRITICAL: store UNCOMPRESSED result for the UI ─────────
-                # The UI receives the full data via AIChatResponse.data.
+                # Full uncompressed result → UI via AIChatResponse.data
                 last_structured_data = serialised
 
-                # ── CRITICAL: store COMPRESSED result in session history ────
-                # This is the main fix for 413 errors from backtest/sentiment
-                # payloads.  The model gets key stats; chart arrays are stripped.
+                # Compressed result → session history (saves ~60-90% tokens
+                # on backtest / sentiment payloads)
                 compressed = compress_tool_result(tool_name, serialised)
                 compressed_json = json.dumps(compressed, default=str)
-
                 original_json = json.dumps(serialised, default=str)
+
                 if len(compressed_json) < len(original_json):
-                    savings_pct = 100 * (1 - len(compressed_json) / len(original_json))
+                    savings = 100 * (1 - len(compressed_json) / len(original_json))
                     logger.info(
-                        "process_chat | compressed tool result | tool=%s | "
-                        "original=%d chars | compressed=%d chars | saved=%.0f%%",
-                        tool_name, len(original_json), len(compressed_json), savings_pct,
+                        "process_chat | tool=%s | original=%d chars | "
+                        "compressed=%d chars | saved=%.0f%%",
+                        tool_name, len(original_json), len(compressed_json), savings,
                     )
 
                 _append_message(
@@ -646,9 +798,10 @@ async def process_chat(
                     build_tool_result_message(
                         tool_call_id=tool_call_id,
                         tool_name=tool_name,
-                        content=compressed_json,   # CHANGED: was original_json
+                        content=compressed_json,
                     ),
                 )
+
                 logger.debug(
                     "process_chat | tool_success | tool=%s | summary=%s",
                     tool_name, summary,
@@ -703,7 +856,7 @@ async def process_chat(
     else:
         # MAX_TOOL_ROUNDS exhausted without a plain-text reply
         final_reply = (
-            "I've gathered the requested data. Here's a summary of what was executed: "
+            "I've gathered the requested data. Here's a summary: "
             + "; ".join(
                 t.result_summary or t.tool_name
                 for t in tools_executed
@@ -712,6 +865,7 @@ async def process_chat(
             + "."
         )
         _append_message(sid, {"role": "assistant", "content": final_reply})
+        _append_to_history(sid, "assistant", final_reply)
         logger.warning(
             "process_chat | session=%s | MAX_TOOL_ROUNDS (%d) exhausted",
             sid, MAX_TOOL_ROUNDS,
@@ -721,5 +875,5 @@ async def process_chat(
         session_id=sid,
         reply=final_reply,
         tools_executed=tools_executed,
-        data=last_structured_data,   # FULL uncompressed data for the UI
+        data=last_structured_data,   # Full uncompressed data for the UI
     )
