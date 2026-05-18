@@ -6,34 +6,32 @@ Responsibilities
 ----------------
 1.  Maintain per-session conversation history in-memory (keyed by session_id)
 2.  Receive a user prompt and build a full OpenAI-format messages list
-3.  Send the prompt to Groq via the OpenAI-compatible SDK
-4.  Parse ``tool_calls`` from the response and dispatch to backend services
-5.  Inject tool results back as ``role="tool"`` messages and loop
-6.  Return AIChatResponse with the final text reply + tool execution trace
+3.  Pre-flight token estimation before every Groq call
+4.  Send the (trimmed) messages to Groq via the OpenAI-compatible SDK
+5.  Parse ``tool_calls`` from the response and dispatch to backend services
+6.  Compress tool results before storing them in session history
+7.  Inject tool results back as ``role="tool"`` messages and loop
+8.  Return AIChatResponse with the final text reply + tool execution trace
 
-Migration notes vs. Gemini implementation
-------------------------------------------
-| Gemini concept                     | OpenAI/Groq replacement              |
-|------------------------------------|--------------------------------------|
-| role="model"                       | role="assistant"                     |
-| role="user" (function_response)    | role="tool"  (tool_call_id required) |
-| parts=[{"function_call": ...}]     | message.tool_calls=[...]             |
-| parts=[{"function_response": ...}] | {"role":"tool","tool_call_id":...}   |
-| chat.send_message(msg)             | client.chat.completions.create(...)  |
-| asyncio.to_thread(chat.send_msg)   | native await (Groq SDK is async)     |
-| model.start_chat(history=...)      | full messages[] list each request    |
+TOKEN OPTIMISATION CHANGES (vs original)
+-----------------------------------------
+| Problem                            | Fix                                        |
+|------------------------------------|--------------------------------------------|
+| _MAX_HISTORY_MESSAGES=50 by count  | Budget managed in TOKENS not message count |
+| Tool results stored raw (~15K tok) | Compressed via compress_tool_result()      |
+| max_tokens=4096 per call           | Lowered to 1024 (overridable)              |
+| No pre-flight token check          | estimate_messages_tokens() before each call|
+| 413 crashes request                | Retry loop with trim → summarise → retry   |
+| Verbose system prompt              | Compact SYSTEM_PROMPT (~110 tokens)        |
 
-Key architectural improvements over Gemini version
----------------------------------------------------
-- No thread-executor overhead: Groq client is fully async.
-- Tool results carry ``tool_call_id`` for strict protocol compliance.
-- History format is standard OpenAI messages[] – portable to any compatible LLM.
-- ``parallel_tool_calls=True`` enables fan-out in a single round (same as Gemini).
-- Structured debug logging for every tool call and LLM round.
-- Timeout guard via ``asyncio.wait_for`` on every Groq call.
-- Malformed tool-argument recovery: bad JSON is caught, logged, and the tool
-  receives an empty args dict rather than crashing the whole request.
-- Token budget awareness: history is pruned before it overflows context.
+Groq 413 error handling
+------------------------
+When a 413 (request too large) is returned we:
+  1. Trim history via trim_history() to drop old messages.
+  2. If still too large, inject a compact summary and keep only the tail.
+  3. Retry the call once.  If it fails again we raise a 503 with a clear msg.
+
+This is transparent to the user – they never see the 413; they get the answer.
 """
 
 from __future__ import annotations
@@ -71,6 +69,15 @@ from app.services import (
 from app.schemas.backtest_schema import BacktestRunRequest
 from app.schemas.sentiment_schema import SentimentRunRequest
 
+# NEW: import token-budget utilities
+from app.models.token_budget import (
+    TOKEN_BUDGET,
+    build_summary_message,
+    compress_tool_result,
+    estimate_messages_tokens,
+    trim_history,
+)
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -82,12 +89,24 @@ logger = logging.getLogger("tradex.ai.service")
 # ---------------------------------------------------------------------------
 
 MAX_TOOL_ROUNDS: int = 5       # maximum tool-call → result cycles per request
-_GROQ_TIMEOUT: float = 60.0    # seconds to wait for each Groq API call
-_MAX_HISTORY_MESSAGES: int = 50  # trim window to prevent context overflow
+_GROQ_TIMEOUT: float = 60.0    # seconds per Groq API call
+
+# CHANGED: history is now governed by TOKEN_BUDGET (from token_budget.py),
+# not by a fixed message count.  _MAX_HISTORY_MESSAGES is kept as a hard cap
+# to bound memory even if individual messages are very short.
+_MAX_HISTORY_MESSAGES: int = 40
+
+# Max tokens to request from the model.
+# Lower = fewer TPM consumed = less risk of 413.
+# For a trading Q&A assistant 1 024 output tokens is almost always enough.
+_DEFAULT_MAX_OUTPUT_TOKENS: int = 1_024
+
+# Groq HTTP error codes that indicate a payload-too-large condition.
+_GROQ_PAYLOAD_TOO_LARGE_CODES: frozenset[int] = frozenset({413, 400})
 
 # ---------------------------------------------------------------------------
 # In-memory session store
-# Maps session_id → list[dict] in OpenAI messages format
+# Maps session_id → list[dict] in OpenAI messages format.
 # Replace with Redis for multi-instance production deployments.
 # ---------------------------------------------------------------------------
 
@@ -102,37 +121,45 @@ def _get_or_create_session(session_id: Optional[str]) -> str:
     """Return existing session id or create a new one."""
     if not session_id or session_id not in _SESSION_STORE:
         sid = session_id or str(uuid.uuid4())
-        # Seed with system prompt so every conversation starts with it
-        _SESSION_STORE[sid] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
+        _SESSION_STORE[sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
         return sid
     return session_id
 
 
 def _append_message(session_id: str, message: dict[str, Any]) -> None:
     """
-    Append one OpenAI-format message dict to the session history and trim if
-    the history exceeds _MAX_HISTORY_MESSAGES.
+    Append one OpenAI-format message to the session history.
 
-    The system message at index 0 is always preserved during trimming so the
-    model never loses its instructions.
+    Trimming strategy (CHANGED from original):
+    - Hard cap: if message count exceeds _MAX_HISTORY_MESSAGES, drop oldest
+      non-system messages first (same as before).
+    - Token cap: after appending, if estimated tokens exceed TOKEN_BUDGET,
+      run trim_history() to bring it back under budget.
+
+    The system message at index 0 is always preserved.
     """
     history = _SESSION_STORE.setdefault(
         session_id, [{"role": "system", "content": SYSTEM_PROMPT}]
     )
     history.append(message)
+
+    # Hard message-count cap (memory guard)
     if len(history) > _MAX_HISTORY_MESSAGES:
-        # Keep system message + most recent (_MAX_HISTORY_MESSAGES - 1) turns
         _SESSION_STORE[session_id] = [history[0]] + history[-(
             _MAX_HISTORY_MESSAGES - 1
         ):]
+        history = _SESSION_STORE[session_id]
+
+    # Token cap – run trim only when we're clearly over budget
+    current_tokens = estimate_messages_tokens(history)
+    if current_tokens > TOKEN_BUDGET:
+        _SESSION_STORE[session_id] = trim_history(history, budget=TOKEN_BUDGET)
 
 
 def get_session_messages(session_id: str) -> list[ChatMessage]:
     """
     Return conversation history as ChatMessage objects for GET /ai/history.
-    Filters to user and assistant text turns only; skips tool messages.
+    Filters to user and assistant text turns; skips tool messages.
     """
     history = _SESSION_STORE.get(session_id, [])
     messages: list[ChatMessage] = []
@@ -160,8 +187,142 @@ def delete_session(session_id: str) -> bool:
 
 
 # ===========================================================================
+# Token-aware Groq call with 413 retry logic
+# ===========================================================================
+
+async def _call_groq_with_budget(
+    session_id: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
+) -> Any:
+    """
+    Wrapper around call_groq() that:
+
+    1. Estimates token count before sending.
+    2. If estimate exceeds TOKEN_BUDGET, trims history pre-emptively.
+    3. Calls Groq with asyncio.wait_for timeout.
+    4. On 413/400 (payload too large): trims aggressively, injects a summary,
+       and retries ONCE.
+    5. On repeated failure: raises HTTP 503 with a human-readable message.
+
+    This is the SINGLE place where all Groq calls go – ai_service never calls
+    call_groq() directly anymore.
+
+    Parameters
+    ----------
+    session_id : Used only for logging.
+    messages   : The full messages list to send (may be mutated by retry).
+    max_tokens : Passed to call_groq(); lower = safer for TPM budget.
+    """
+
+    # ── Pre-flight estimate ────────────────────────────────────────────────
+    estimated = estimate_messages_tokens(messages)
+    logger.info(
+        "_call_groq_with_budget | session=%s | estimated_tokens=%d | budget=%d",
+        session_id, estimated, TOKEN_BUDGET,
+    )
+
+    if estimated > TOKEN_BUDGET:
+        logger.warning(
+            "_call_groq_with_budget | pre-flight over budget – trimming before call",
+        )
+        messages = trim_history(messages, budget=TOKEN_BUDGET)
+        estimated = estimate_messages_tokens(messages)
+        logger.info(
+            "_call_groq_with_budget | after pre-flight trim | tokens=%d", estimated,
+        )
+
+    # ── First attempt ──────────────────────────────────────────────────────
+    try:
+        return await asyncio.wait_for(
+            call_groq(messages, max_tokens=max_tokens),
+            timeout=_GROQ_TIMEOUT,
+        )
+
+    except asyncio.TimeoutError:
+        logger.error(
+            "_call_groq_with_budget | session=%s | timeout after %.1fs",
+            session_id, _GROQ_TIMEOUT,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Groq API timed out after {_GROQ_TIMEOUT:.0f}s.",
+        )
+
+    except Exception as exc:
+        # ── 413 / payload-too-large detection ─────────────────────────────
+        # The openai SDK wraps HTTP errors; the status_code lives on the
+        # exception body or as exc.status_code / exc.response.status_code.
+        exc_str = str(exc)
+        is_413 = (
+            "413" in exc_str
+            or "Request too large" in exc_str
+            or "request_too_large" in exc_str.lower()
+            or getattr(exc, "status_code", None) in _GROQ_PAYLOAD_TOO_LARGE_CODES
+        )
+
+        if not is_413:
+            logger.error(
+                "_call_groq_with_budget | session=%s | Groq error: %s",
+                session_id, exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Groq API error: {exc}",
+            )
+
+        # ── Retry path: aggressive trim + summary injection ────────────────
+        logger.warning(
+            "_call_groq_with_budget | session=%s | 413 received – retrying with "
+            "aggressive trim + summary",
+            session_id,
+        )
+
+        # Build a compact summary of the old history before we discard it
+        system_msg = messages[0]
+        non_system = messages[1:]
+
+        summary_msg = build_summary_message(non_system)
+
+        # Keep only the last 3 messages (most recent user + assistant exchange)
+        recent_tail = non_system[-3:] if len(non_system) >= 3 else non_system
+
+        # Reconstruct: system → summary → recent tail
+        retry_messages = [system_msg, summary_msg] + recent_tail
+
+        retry_tokens = estimate_messages_tokens(retry_messages)
+        logger.info(
+            "_call_groq_with_budget | retry | tokens=%d | messages=%d",
+            retry_tokens, len(retry_messages),
+        )
+
+        try:
+            return await asyncio.wait_for(
+                call_groq(retry_messages, max_tokens=max_tokens),
+                timeout=_GROQ_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Groq API timed out on retry.",
+            )
+        except Exception as retry_exc:
+            logger.error(
+                "_call_groq_with_budget | session=%s | retry also failed: %s",
+                session_id, retry_exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "The conversation history is too long for the current Groq plan. "
+                    "Please start a new session or delete this session's history "
+                    "via DELETE /ai/history/{session_id}."
+                ),
+            )
+
+
+# ===========================================================================
 # Tool dispatcher
-# Routes OpenAI tool_call names → backend service functions
 # ===========================================================================
 
 async def _dispatch_tool(
@@ -171,10 +332,7 @@ async def _dispatch_tool(
 ) -> Any:
     """
     Route a tool call to the correct backend service function.
-
-    Returns the Pydantic model or primitive from the service.
-    Raises HTTPException (propagated to caller) on service-level errors.
-    Raises ValueError for unknown tool names.
+    Business logic is UNCHANGED from the original implementation.
     """
 
     # ── Strategies ─────────────────────────────────────────────────────────
@@ -278,14 +436,11 @@ async def _dispatch_tool(
 
 
 # ===========================================================================
-# Result serialisation helpers (unchanged from Gemini version)
+# Result serialisation helpers (unchanged from original)
 # ===========================================================================
 
 def _serialise_result(result: Any) -> dict[str, Any]:
-    """
-    Convert a service result to a JSON-serialisable dict.
-    Pydantic models → .model_dump(); lists → element-wise; primitives wrapped.
-    """
+    """Convert a service result to a JSON-serialisable dict."""
     if result is None:
         return {}
     if hasattr(result, "model_dump"):
@@ -371,28 +526,32 @@ async def process_chat(
     ----
     1.  Retrieve or create a session; load existing OpenAI-format history.
     2.  Append the new user turn to history.
-    3.  POST the full messages list to Groq.
+    3.  Snapshot history + run token pre-flight check via _call_groq_with_budget().
     4.  If the model returns ``tool_calls``:
           a.  Echo the assistant message (with tool_calls) back into history.
           b.  Dispatch each tool call to the correct backend service.
-          c.  Append each result as a ``role="tool"`` message.
-          d.  Repeat from step 3 (up to MAX_TOOL_ROUNDS times).
+          c.  Compress the tool result (strip chart arrays) before storing.
+          d.  Append each result as a ``role="tool"`` message.
+          e.  Repeat from step 3 (up to MAX_TOOL_ROUNDS times).
     5.  When the model returns a plain text reply, persist history and return.
 
-    Differences from the Gemini orchestration loop
-    -----------------------------------------------
-    - Messages list is passed whole every round (no start_chat abstraction).
-    - Tool results use role="tool" + tool_call_id (not role="user" + parts).
-    - The assistant message that contains tool_calls is echoed back verbatim
-      (required by the OpenAI protocol so the model tracks its own decisions).
-    - Groq call is wrapped in asyncio.wait_for for timeout safety.
-    - Debug logging records every round, every tool call, and every result.
+    KEY CHANGES vs original
+    -----------------------
+    - call_groq() is replaced by _call_groq_with_budget() everywhere.
+    - Tool results are compressed via compress_tool_result() before being
+      stored in session history (the uncompressed version is still returned
+      to the UI via last_structured_data / AIChatResponse.data).
+    - Token estimation + trim happens proactively on every round, not just
+      reactively on error.
     """
     sid = _get_or_create_session(session_id)
 
     # Append the incoming user message
     _append_message(sid, {"role": "user", "content": user_message})
-    logger.info("process_chat | session=%s | user_message_len=%d", sid, len(user_message))
+    logger.info(
+        "process_chat | session=%s | user_message_len=%d",
+        sid, len(user_message),
+    )
 
     tools_executed: list[ToolExecution] = []
     last_structured_data: Optional[dict[str, Any]] = None
@@ -400,29 +559,20 @@ async def process_chat(
 
     # ── Orchestration loop ─────────────────────────────────────────────────
     for round_num in range(MAX_TOOL_ROUNDS):
-        logger.debug("process_chat | session=%s | round=%d/%d", sid, round_num + 1, MAX_TOOL_ROUNDS)
+        logger.debug(
+            "process_chat | session=%s | round=%d/%d",
+            sid, round_num + 1, MAX_TOOL_ROUNDS,
+        )
 
         # Snapshot current history for this round's API call
         current_messages = list(_SESSION_STORE.get(sid, []))
 
-        # ── Call Groq (with timeout) ───────────────────────────────────────
-        try:
-            response = await asyncio.wait_for(
-                call_groq(current_messages),
-                timeout=_GROQ_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error("process_chat | session=%s | Groq timeout after %.1fs", sid, _GROQ_TIMEOUT)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Groq API timed out after {_GROQ_TIMEOUT:.0f}s.",
-            )
-        except Exception as exc:
-            logger.error("process_chat | session=%s | Groq error: %s", sid, exc)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Groq API error: {exc}",
-            )
+        # ── Call Groq (token-aware, with 413 retry) ────────────────────────
+        response = await _call_groq_with_budget(
+            session_id=sid,
+            messages=current_messages,
+            max_tokens=_DEFAULT_MAX_OUTPUT_TOKENS,
+        )
 
         tool_calls = extract_tool_calls(response)
         text_reply = extract_text(response)
@@ -438,8 +588,6 @@ async def process_chat(
             break
 
         # ── Echo assistant message (with tool_calls) into history ──────────
-        # This is mandatory in the OpenAI protocol – the model must see its
-        # own tool_calls before it receives the tool results.
         assistant_msg = build_assistant_tool_call_message(response)
         _append_message(sid, assistant_msg)
 
@@ -473,15 +621,32 @@ async def process_chat(
                         result_summary=summary,
                     )
                 )
+
+                # ── CRITICAL: store UNCOMPRESSED result for the UI ─────────
+                # The UI receives the full data via AIChatResponse.data.
                 last_structured_data = serialised
 
-                # Inject successful tool result into history
+                # ── CRITICAL: store COMPRESSED result in session history ────
+                # This is the main fix for 413 errors from backtest/sentiment
+                # payloads.  The model gets key stats; chart arrays are stripped.
+                compressed = compress_tool_result(tool_name, serialised)
+                compressed_json = json.dumps(compressed, default=str)
+
+                original_json = json.dumps(serialised, default=str)
+                if len(compressed_json) < len(original_json):
+                    savings_pct = 100 * (1 - len(compressed_json) / len(original_json))
+                    logger.info(
+                        "process_chat | compressed tool result | tool=%s | "
+                        "original=%d chars | compressed=%d chars | saved=%.0f%%",
+                        tool_name, len(original_json), len(compressed_json), savings_pct,
+                    )
+
                 _append_message(
                     sid,
                     build_tool_result_message(
                         tool_call_id=tool_call_id,
                         tool_name=tool_name,
-                        content=json.dumps(serialised, default=str),
+                        content=compressed_json,   # CHANGED: was original_json
                     ),
                 )
                 logger.debug(
@@ -556,5 +721,5 @@ async def process_chat(
         session_id=sid,
         reply=final_reply,
         tools_executed=tools_executed,
-        data=last_structured_data,
+        data=last_structured_data,   # FULL uncompressed data for the UI
     )
