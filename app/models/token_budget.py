@@ -496,7 +496,7 @@ def emergency_compress(
     if estimate_messages_tokens(minimal) <= budget:
         return minimal
 
-    # Nuclear option: system + truncated summary
+    # option: system + truncated summary
     max_summary_chars = int(budget * _CHARS_PER_TOKEN * 0.8)
     truncated_content = summary_msg["content"][:max_summary_chars]
     return [system_msg, {"role": "user", "content": truncated_content}]
